@@ -1,0 +1,7 @@
+name = "my-music-worker"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[r2_buckets]]
+binding = "MUSIC_BUCKET"
+bucket_name = "my-music-bucket"

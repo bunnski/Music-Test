@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>My Music</title>
+<style>
+  body { font-family: sans-serif; max-width: 500px; margin: 40px auto; padding: 0 16px; }
+  li { padding: 8px; cursor: pointer; border-bottom: 1px solid #ddd; }
+  li:hover { background: #f0f0f0; }
+  audio { width: 100%; margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<h2>My Music</h2>
+<ul id="track-list">Loading...</ul>
+<audio id="player" controls></audio>
+
+<script>
+  // CHANGE THIS to your deployed worker URL
+  const WORKER_URL = "https://my-music-worker.noahnator-workers.workers.dev";
+
+  let token = sessionStorage.getItem("auth_token");
+  if (!token) {
+    token = prompt("Enter password:");
+    sessionStorage.setItem("auth_token", token);
+  }
+
+  async function loadTracks() {
+    const res = await fetch(WORKER_URL + "/api/tracks", {
+      headers: { "X-Auth-Token": token },
+    });
+
+    if (!res.ok) {
+      document.getElementById("track-list").textContent = "Auth failed. Refresh and re-enter password.";
+      sessionStorage.removeItem("auth_token");
+      return;
+    }
+
+    const tracks = await res.json();
+    const list = document.getElementById("track-list");
+    list.innerHTML = "";
+
+    tracks.forEach((track) => {
+      const li = document.createElement("li");
+      li.textContent = track.key;
+      li.onclick = () => playTrack(track.key);
+      list.appendChild(li);
+    });
+  }
+
+  function playTrack(key) {
+    const player = document.getElementById("player");
+    const streamUrl = `${WORKER_URL}/api/stream/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
+    player.src = streamUrl;
+    player.play();
+  }
+
+  loadTracks();
+</script>
+
+</body>
+</html>
