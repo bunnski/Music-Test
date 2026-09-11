@@ -18,6 +18,12 @@
 <ul id="list">Loading...</ul>
 <audio id="player" controls></audio>
 
+<style>
+  .folder-item { display: flex; align-items: center; gap: 10px; }
+  .folder-thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; background: #ddd; }
+  .track-item.playing { background: #dff0d8; font-weight: bold; }
+</style>
+
 <script>
   // CHANGE THIS to your deployed worker URL
   const WORKER_URL = "https://my-music-worker.noahnator-workers.workers.dev";
@@ -32,6 +38,10 @@
   const coverEl = document.getElementById("cover");
   const backBtn = document.getElementById("back-btn");
   const titleEl = document.getElementById("page-title");
+  const player = document.getElementById("player");
+
+  let currentTracks = [];   // tracks in the currently open soundtrack
+  let currentIndex = -1;    // index of track currently playing
 
   backBtn.onclick = () => loadSoundtracks();
 
@@ -47,19 +57,35 @@
     return res.json();
   }
 
+  function streamUrl(key) {
+    return `${WORKER_URL}/api/stream/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
+  }
+
   async function loadSoundtracks() {
     titleEl.textContent = "My Music";
     backBtn.style.display = "none";
     coverEl.style.display = "none";
     listEl.innerHTML = "Loading...";
+    currentTracks = [];
+    currentIndex = -1;
 
     const folders = await authedFetch("/api/soundtracks");
     listEl.innerHTML = "";
 
     folders.forEach((folder) => {
       const li = document.createElement("li");
-      li.textContent = folder;
-      li.onclick = () => loadSoundtrack(folder);
+      li.className = "folder-item";
+
+      const thumb = document.createElement("img");
+      thumb.className = "folder-thumb";
+      if (folder.cover) thumb.src = streamUrl(folder.cover);
+
+      const label = document.createElement("span");
+      label.textContent = folder.name;
+
+      li.appendChild(thumb);
+      li.appendChild(label);
+      li.onclick = () => loadSoundtrack(folder.name);
       listEl.appendChild(li);
     });
   }
@@ -70,29 +96,42 @@
     listEl.innerHTML = "Loading...";
 
     const data = await authedFetch("/api/soundtracks/" + encodeURIComponent(folder));
+    currentTracks = data.tracks;
+    currentIndex = -1;
 
     if (data.cover) {
-      coverEl.src = `${WORKER_URL}/api/stream/${encodeURIComponent(data.cover)}?token=${encodeURIComponent(token)}`;
+      coverEl.src = streamUrl(data.cover);
       coverEl.style.display = "block";
     } else {
       coverEl.style.display = "none";
     }
 
+    renderTrackList();
+  }
+
+  function renderTrackList() {
     listEl.innerHTML = "";
-    data.tracks.forEach((track) => {
+    currentTracks.forEach((track, i) => {
       const li = document.createElement("li");
+      li.className = "track-item" + (i === currentIndex ? " playing" : "");
       li.textContent = track.name;
-      li.onclick = () => playTrack(track.key);
+      li.onclick = () => playTrackAt(i);
       listEl.appendChild(li);
     });
   }
 
-  function playTrack(key) {
-    const player = document.getElementById("player");
-    const streamUrl = `${WORKER_URL}/api/stream/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
-    player.src = streamUrl;
+  function playTrackAt(i) {
+    if (i < 0 || i >= currentTracks.length) return; // reached end, stop
+    currentIndex = i;
+    player.src = streamUrl(currentTracks[i].key);
     player.play();
+    renderTrackList();
   }
+
+  // auto-play next track when current one finishes
+  player.addEventListener("ended", () => {
+    playTrackAt(currentIndex + 1);
+  });
 
   loadSoundtracks();
 </script>

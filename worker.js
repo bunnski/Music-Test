@@ -23,11 +23,24 @@ export default {
       return new Response("Unauthorized", { status: 401, headers: corsHeaders });
     }
 
-    // GET /api/soundtracks -> list top-level folders (each = one soundtrack)
+    // GET /api/soundtracks -> list top-level folders (each = one soundtrack) with their cover image
     if (path === "/api/soundtracks") {
-      const listed = await env.MUSIC_BUCKET.list({ delimiter: "/" });
-      const folders = listed.delimitedPrefixes.map((p) => p.replace(/\/$/, ""));
-      return new Response(JSON.stringify(folders), {
+      const listed = await env.MUSIC_BUCKET.list();
+      const folderMap = {};
+
+      for (const obj of listed.objects) {
+        const parts = obj.key.split("/");
+        if (parts.length < 2) continue; // skip files not inside a folder
+        const folder = parts[0];
+        const filename = parts[parts.length - 1];
+
+        if (!folderMap[folder]) folderMap[folder] = { name: folder, cover: null };
+        if (/\.(jpg|jpeg|png|webp)$/i.test(filename)) {
+          folderMap[folder].cover = obj.key;
+        }
+      }
+
+      return new Response(JSON.stringify(Object.values(folderMap)), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
