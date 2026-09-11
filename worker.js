@@ -1,13 +1,45 @@
 // worker.js
 // Deploy this as a Cloudflare Worker bound to your R2 bucket.
 // Set AUTH_TOKEN as a secret: wrangler secret put AUTH_TOKEN
+//
+// STORAGE MODEL:
+// - Actual files live permanently at media/<soundtrackId>/<filename> and never move.
+// - A single "_library.json" file holds all organization: names, categories, order, pins.
+// - Moving a soundtrack to a different category, renaming, reordering, and pinning are
+//   all just edits to _library.json - no file copying, so they're instant regardless of file size.
+
+const LIBRARY_KEY = "_library.json";
+
+function slugify(str) {
+  return str.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-+|-+$)/g, "").slice(0, 40) || "soundtrack";
+}
+
+function generateId(name) {
+  const suffix = crypto.randomUUID().split("-")[0]; // short random hex chunk
+  return `${slugify(name)}-${suffix}`;
+}
+
+async function getLibrary(env) {
+  const object = await env.MUSIC_BUCKET.get(LIBRARY_KEY);
+  if (!object) {
+    return { soundtracks: {}, categories: [], order: {} };
+  }
+  return JSON.parse(await object.text());
+}
+
+async function saveLibrary(env, library) {
+  await env.MUSIC_BUCKET.put(LIBRARY_KEY, JSON.stringify(library));
+}
+
+function isCoverFile(filename) {
+  return /\.(jpg|jpeg|png|webp)$/i.test(filename);
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // simple CORS so your static site can call this worker from any host
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, X-Auth-Token",
@@ -17,109 +49,250 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // check auth token, either header (for /api/tracks) or query param (for streaming, since <audio> can't send headers)
     const token = request.headers.get("X-Auth-Token") || url.searchParams.get("token");
     if (token !== env.AUTH_TOKEN) {
       return new Response("Unauthorized", { status: 401, headers: corsHeaders });
     }
 
-    // POST /api/upload?key=<object key> -> write the request body as a file at that key (creates folders implicitly)
-    if (path === "/api/upload" && request.method === "POST") {
-      const key = url.searchParams.get("key");
-      if (!key) {
-        return new Response("Missing key", { status: 400, headers: corsHeaders });
+    const json = (data, status) => new Response(JSON.stringify(data), {
+      status: status || 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
+    // POST /api/upgrade-ids -> ONE-TIME USE: finds soundtracks still using the old raw-UUID folder format
+    // and moves their files to a new slugified folder, updating all references. Safe to call multiple times.
+    if (path === "/api/upgrade-ids" && request.method === "POST") {
+      const library = await getLibrary(env);
+      const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      let upgradedCount = 0;
+
+      for (const oldId of Object.keys(library.soundtracks)) {
+        if (!uuidPattern.test(oldId)) continue; // already slugified, skip
+
+        const entry = library.soundtracks[oldId];
+        const newId = generateId(entry.name);
+
+        const listed = await env.MUSIC_BUCKET.list({ prefix: `media/${oldId}/` });
+        for (const obj of listed.objects) {
+          const filename = obj.key.split("/").pop();
+          const newKey = `media/${newId}/${filename}`;
+          const object = await env.MUSIC_BUCKET.get(obj.key);
+          if (!object) continue;
+          await env.MUSIC_BUCKET.put(newKey, object.body, { httpMetadata: object.httpMetadata });
+          await env.MUSIC_BUCKET.delete(obj.key);
+
+          if (entry.cover === obj.key) entry.cover = newKey;
+          const track = entry.tracks.find((t) => t.key === obj.key);
+          if (track) track.key = newKey;
+        }
+
+        entry.id = newId;
+        library.soundtracks[newId] = entry;
+        delete library.soundtracks[oldId];
+
+        // update any order lists (top-level, within categories, and pinned) that reference the old id
+        for (const key of Object.keys(library.order)) {
+          library.order[key] = library.order[key].map((k) => (k === oldId ? newId : k));
+        }
+
+        upgradedCount++;
       }
+
+      await saveLibrary(env, library);
+      return json({ success: true, upgraded: upgradedCount });
+    }
+
+    // POST /api/migrate-legacy -> ONE-TIME USE: scans old-style folders (Folder/track.mp3 or Category/Folder/track.mp3)
+    // and imports them into the new manifest system, moving each file once. Safe to call multiple times - already
+    // migrated soundtracks are skipped.
+    if (path === "/api/migrate-legacy" && request.method === "POST") {
+      const library = await getLibrary(env);
+      const listed = await env.MUSIC_BUCKET.list();
+      const legacyFolders = {}; // "folder" or "category/folder" -> [{key, filename}]
+
+      for (const obj of listed.objects) {
+        if (obj.key === LIBRARY_KEY) continue;
+        if (obj.key.startsWith("media/")) continue; // already migrated
+        const parts = obj.key.split("/");
+        const filename = parts[parts.length - 1];
+        if (filename === ".category" || filename === "_order.json") continue;
+
+        if (parts.length === 2) {
+          const folderKey = parts[0];
+          if (!legacyFolders[folderKey]) legacyFolders[folderKey] = { category: null, name: parts[0], files: [] };
+          legacyFolders[folderKey].files.push({ key: obj.key, filename });
+        } else if (parts.length === 3) {
+          const folderKey = `${parts[0]}/${parts[1]}`;
+          if (!legacyFolders[folderKey]) legacyFolders[folderKey] = { category: parts[0], name: parts[1], files: [] };
+          legacyFolders[folderKey].files.push({ key: obj.key, filename });
+        }
+      }
+
+      let migratedCount = 0;
+      for (const folderKey of Object.keys(legacyFolders)) {
+        const { category, name, files } = legacyFolders[folderKey];
+        const id = generateId(name);
+        const entry = { id, name, category, cover: null, tracks: [] };
+
+        for (const f of files) {
+          const object = await env.MUSIC_BUCKET.get(f.key);
+          if (!object) continue;
+          const newKey = `media/${id}/${f.filename}`;
+          await env.MUSIC_BUCKET.put(newKey, object.body, { httpMetadata: object.httpMetadata });
+          await env.MUSIC_BUCKET.delete(f.key);
+
+          if (isCoverFile(f.filename)) entry.cover = newKey;
+          else entry.tracks.push({ key: newKey, name: f.filename });
+        }
+
+        library.soundtracks[id] = entry;
+        if (category && !library.categories.includes(category)) library.categories.push(category);
+        migratedCount++;
+      }
+
+      await saveLibrary(env, library);
+      return json({ success: true, migrated: migratedCount });
+    }
+
+    // GET /api/library -> the entire manifest: soundtracks, categories, order/pins
+    if (path === "/api/library" && request.method === "GET") {
+      return json(await getLibrary(env));
+    }
+
+    // POST /api/rename-soundtrack { id, name } -> just updates the display name, no file changes
+    if (path === "/api/rename-soundtrack" && request.method === "POST") {
+      const { id, name } = await request.json();
+      if (!id || !name) return new Response("Missing id or name", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      if (!library.soundtracks[id]) return new Response("Unknown soundtrack id", { status: 404, headers: corsHeaders });
+      library.soundtracks[id].name = name;
+      await saveLibrary(env, library);
+      return json({ success: true });
+    }
+
+    // POST /api/rename-category { oldName, newName } -> updates the category name everywhere it's referenced
+    if (path === "/api/rename-category" && request.method === "POST") {
+      const { oldName, newName } = await request.json();
+      if (!oldName || !newName) return new Response("Missing oldName or newName", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      if (!library.categories.includes(oldName)) return new Response("Unknown category", { status: 404, headers: corsHeaders });
+
+      library.categories = library.categories.map((c) => (c === oldName ? newName : c));
+      for (const s of Object.values(library.soundtracks)) {
+        if (s.category === oldName) s.category = newName;
+      }
+      if (library.order[oldName]) {
+        library.order[newName] = library.order[oldName];
+        delete library.order[oldName];
+      }
+      for (const key of Object.keys(library.order)) {
+        library.order[key] = library.order[key].map((k) => (k === oldName ? newName : k));
+      }
+
+      await saveLibrary(env, library);
+      return json({ success: true });
+    }
+
+    // POST /api/create-category { name }
+    if (path === "/api/create-category" && request.method === "POST") {
+      const { name } = await request.json();
+      if (!name) return new Response("Missing name", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      if (!library.categories.includes(name)) library.categories.push(name);
+      await saveLibrary(env, library);
+      return json({ success: true });
+    }
+
+    // POST /api/create-soundtrack { name, category } -> creates an empty soundtrack entry, returns its id
+    if (path === "/api/create-soundtrack" && request.method === "POST") {
+      const { name, category } = await request.json();
+      if (!name) return new Response("Missing name", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      const id = generateId(name);
+      library.soundtracks[id] = { id, name, category: category || null, cover: null, tracks: [] };
+      await saveLibrary(env, library);
+      return json({ success: true, id });
+    }
+
+    // POST /api/upload?id=<soundtrackId> -> body is the raw file; stored at media/<id>/<filename>
+    // filename comes via the X-Filename header (query params mangle special characters less predictably)
+    if (path === "/api/upload" && request.method === "POST") {
+      const id = url.searchParams.get("id");
+      const filename = request.headers.get("X-Filename");
+      if (!id || !filename) return new Response("Missing id or filename", { status: 400, headers: corsHeaders });
+
+      const library = await getLibrary(env);
+      if (!library.soundtracks[id]) return new Response("Unknown soundtrack id", { status: 404, headers: corsHeaders });
+
+      const key = `media/${id}/${filename}`;
       const body = await request.arrayBuffer();
       const contentType = request.headers.get("Content-Type") || "application/octet-stream";
       await env.MUSIC_BUCKET.put(key, body, { httpMetadata: { contentType } });
-      return new Response(JSON.stringify({ success: true, key }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+
+      if (isCoverFile(filename)) {
+        library.soundtracks[id].cover = key;
+      } else {
+        library.soundtracks[id].tracks.push({ key, name: filename });
+      }
+      await saveLibrary(env, library);
+      return json({ success: true, key });
     }
 
-    // GET /api/order -> return saved order map: { "<parentPath>": ["name1","name2",...] }, "" = top level
-    if (path === "/api/order" && request.method === "GET") {
-      const object = await env.MUSIC_BUCKET.get("_order.json");
-      const order = object ? JSON.parse(await object.text()) : {};
-      return new Response(JSON.stringify(order), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    // POST /api/move { id, category } -> just updates which category the soundtrack belongs to. Instant, no file copying.
+    if (path === "/api/move" && request.method === "POST") {
+      const { id, category } = await request.json();
+      const library = await getLibrary(env);
+      if (!library.soundtracks[id]) return new Response("Unknown soundtrack id", { status: 404, headers: corsHeaders });
+      library.soundtracks[id].category = category || null;
+      await saveLibrary(env, library);
+      return json({ success: true });
     }
 
-    // POST /api/order -> body: { parentPath: string, order: [names] }. Merges into the saved order map.
+    // POST /api/delete { type: "soundtrack", id } or { type: "category", name }
+    if (path === "/api/delete" && request.method === "POST") {
+      const { type, id, name } = await request.json();
+      const library = await getLibrary(env);
+
+      async function deleteSoundtrack(sid) {
+        const listed = await env.MUSIC_BUCKET.list({ prefix: `media/${sid}/` });
+        for (const obj of listed.objects) {
+          await env.MUSIC_BUCKET.delete(obj.key);
+        }
+        delete library.soundtracks[sid];
+        // remove from any order lists / pins
+        for (const key of Object.keys(library.order)) {
+          library.order[key] = library.order[key].filter((k) => k !== sid);
+        }
+      }
+
+      if (type === "soundtrack" && id) {
+        await deleteSoundtrack(id);
+      } else if (type === "category" && name) {
+        const idsInCategory = Object.values(library.soundtracks).filter((s) => s.category === name).map((s) => s.id);
+        for (const sid of idsInCategory) {
+          await deleteSoundtrack(sid);
+        }
+        library.categories = library.categories.filter((c) => c !== name);
+        delete library.order[name];
+        for (const key of Object.keys(library.order)) {
+          library.order[key] = library.order[key].filter((k) => k !== name);
+        }
+      } else {
+        return new Response("Invalid delete request", { status: 400, headers: corsHeaders });
+      }
+
+      await saveLibrary(env, library);
+      return json({ success: true });
+    }
+
+    // POST /api/order { parentPath, order } -> parentPath "" = top level, a category name = within that category,
+    // "_pinned" = the pinned list. Just saves the given array of keys (ids or category names) in that slot.
     if (path === "/api/order" && request.method === "POST") {
       const { parentPath, order } = await request.json();
-      const object = await env.MUSIC_BUCKET.get("_order.json");
-      const fullOrder = object ? JSON.parse(await object.text()) : {};
-      fullOrder[parentPath] = order;
-      await env.MUSIC_BUCKET.put("_order.json", JSON.stringify(fullOrder));
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // GET /api/soundtracks -> tree of { categories: [{name, soundtracks:[{name,cover,path}]}], soundtracks: [{name,cover,path}] }
-    // A file 2 levels deep (Folder/track.mp3) is a top-level soundtrack.
-    // A file 3 levels deep (Category/Folder/track.mp3) is a soundtrack nested inside a category.
-    if (path === "/api/soundtracks") {
-      const listed = await env.MUSIC_BUCKET.list();
-      const directMap = {};   // folder name -> {name, cover, path}
-      const categoryMap = {}; // category name -> { folder name -> {name, cover, path} }
-
-      for (const obj of listed.objects) {
-        const parts = obj.key.split("/");
-        const filename = parts[parts.length - 1];
-        const isCover = /\.(jpg|jpeg|png|webp)$/i.test(filename);
-
-        if (parts.length === 2) {
-          const folder = parts[0];
-          if (!directMap[folder]) directMap[folder] = { name: folder, cover: null, path: folder };
-          if (isCover) directMap[folder].cover = obj.key;
-        } else if (parts.length === 3) {
-          const category = parts[0];
-          const folder = parts[1];
-          if (!categoryMap[category]) categoryMap[category] = {};
-          if (!categoryMap[category][folder]) {
-            categoryMap[category][folder] = { name: folder, cover: null, path: `${category}/${folder}` };
-          }
-          if (isCover) categoryMap[category][folder].cover = obj.key;
-        }
-        // files deeper than 3 levels, or at the root (parts.length === 1, e.g. _order.json), are ignored
-      }
-
-      const tree = {
-        soundtracks: Object.values(directMap),
-        categories: Object.entries(categoryMap).map(([name, folders]) => ({
-          name,
-          soundtracks: Object.values(folders),
-        })),
-      };
-
-      return new Response(JSON.stringify(tree), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // GET /api/soundtracks/<folder> -> list files inside one folder, split into cover image + tracks
-    if (path.startsWith("/api/soundtracks/")) {
-      const folder = decodeURIComponent(path.replace("/api/soundtracks/", ""));
-      const listed = await env.MUSIC_BUCKET.list({ prefix: folder + "/" });
-
-      let cover = null;
-      const tracks = [];
-
-      for (const obj of listed.objects) {
-        const filename = obj.key.split("/").pop();
-        if (/\.(jpg|jpeg|png|webp)$/i.test(filename)) {
-          cover = obj.key;
-        } else if (/\.(mp3|wav|m4a|ogg|flac)$/i.test(filename)) {
-          tracks.push({ key: obj.key, name: filename, size: obj.size });
-        }
-      }
-
-      return new Response(JSON.stringify({ cover, tracks }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      const library = await getLibrary(env);
+      library.order[parentPath] = order;
+      await saveLibrary(env, library);
+      return json({ success: true });
     }
 
     // GET /api/stream/<key> -> stream the actual file
