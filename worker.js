@@ -23,24 +23,79 @@ export default {
       return new Response("Unauthorized", { status: 401, headers: corsHeaders });
     }
 
-    // GET /api/soundtracks -> list top-level folders (each = one soundtrack) with their cover image
+    // POST /api/upload?key=<object key> -> write the request body as a file at that key (creates folders implicitly)
+    if (path === "/api/upload" && request.method === "POST") {
+      const key = url.searchParams.get("key");
+      if (!key) {
+        return new Response("Missing key", { status: 400, headers: corsHeaders });
+      }
+      const body = await request.arrayBuffer();
+      const contentType = request.headers.get("Content-Type") || "application/octet-stream";
+      await env.MUSIC_BUCKET.put(key, body, { httpMetadata: { contentType } });
+      return new Response(JSON.stringify({ success: true, key }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // GET /api/order -> return saved order map: { "<parentPath>": ["name1","name2",...] }, "" = top level
+    if (path === "/api/order" && request.method === "GET") {
+      const object = await env.MUSIC_BUCKET.get("_order.json");
+      const order = object ? JSON.parse(await object.text()) : {};
+      return new Response(JSON.stringify(order), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // POST /api/order -> body: { parentPath: string, order: [names] }. Merges into the saved order map.
+    if (path === "/api/order" && request.method === "POST") {
+      const { parentPath, order } = await request.json();
+      const object = await env.MUSIC_BUCKET.get("_order.json");
+      const fullOrder = object ? JSON.parse(await object.text()) : {};
+      fullOrder[parentPath] = order;
+      await env.MUSIC_BUCKET.put("_order.json", JSON.stringify(fullOrder));
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // GET /api/soundtracks -> tree of { categories: [{name, soundtracks:[{name,cover,path}]}], soundtracks: [{name,cover,path}] }
+    // A file 2 levels deep (Folder/track.mp3) is a top-level soundtrack.
+    // A file 3 levels deep (Category/Folder/track.mp3) is a soundtrack nested inside a category.
     if (path === "/api/soundtracks") {
       const listed = await env.MUSIC_BUCKET.list();
-      const folderMap = {};
+      const directMap = {};   // folder name -> {name, cover, path}
+      const categoryMap = {}; // category name -> { folder name -> {name, cover, path} }
 
       for (const obj of listed.objects) {
         const parts = obj.key.split("/");
-        if (parts.length < 2) continue; // skip files not inside a folder
-        const folder = parts[0];
         const filename = parts[parts.length - 1];
+        const isCover = /\.(jpg|jpeg|png|webp)$/i.test(filename);
 
-        if (!folderMap[folder]) folderMap[folder] = { name: folder, cover: null };
-        if (/\.(jpg|jpeg|png|webp)$/i.test(filename)) {
-          folderMap[folder].cover = obj.key;
+        if (parts.length === 2) {
+          const folder = parts[0];
+          if (!directMap[folder]) directMap[folder] = { name: folder, cover: null, path: folder };
+          if (isCover) directMap[folder].cover = obj.key;
+        } else if (parts.length === 3) {
+          const category = parts[0];
+          const folder = parts[1];
+          if (!categoryMap[category]) categoryMap[category] = {};
+          if (!categoryMap[category][folder]) {
+            categoryMap[category][folder] = { name: folder, cover: null, path: `${category}/${folder}` };
+          }
+          if (isCover) categoryMap[category][folder].cover = obj.key;
         }
+        // files deeper than 3 levels, or at the root (parts.length === 1, e.g. _order.json), are ignored
       }
 
-      return new Response(JSON.stringify(Object.values(folderMap)), {
+      const tree = {
+        soundtracks: Object.values(directMap),
+        categories: Object.entries(categoryMap).map(([name, folders]) => ({
+          name,
+          soundtracks: Object.values(folders),
+        })),
+      };
+
+      return new Response(JSON.stringify(tree), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
