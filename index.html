@@ -12,13 +12,15 @@
 </head>
 <body>
 
-<h2>My Music</h2>
-<ul id="track-list">Loading...</ul>
+<h2 id="page-title">My Music</h2>
+<button id="back-btn" style="display:none;">Back to soundtracks</button>
+<img id="cover" style="display:none; width:100%; margin-top:12px; border-radius:8px;">
+<ul id="list">Loading...</ul>
 <audio id="player" controls></audio>
 
 <script>
   // CHANGE THIS to your deployed worker URL
-  const WORKER_URL = "https://my-music-worker.noahnator-workers.workers.dev";
+  const WORKER_URL = "https://my-music-worker.YOUR-SUBDOMAIN.workers.dev";
 
   let token = sessionStorage.getItem("auth_token");
   if (!token) {
@@ -26,26 +28,62 @@
     sessionStorage.setItem("auth_token", token);
   }
 
-  async function loadTracks() {
-    const res = await fetch(WORKER_URL + "/api/tracks", {
+  const listEl = document.getElementById("list");
+  const coverEl = document.getElementById("cover");
+  const backBtn = document.getElementById("back-btn");
+  const titleEl = document.getElementById("page-title");
+
+  backBtn.onclick = () => loadSoundtracks();
+
+  async function authedFetch(path) {
+    const res = await fetch(WORKER_URL + path, {
       headers: { "X-Auth-Token": token },
     });
-
     if (!res.ok) {
-      document.getElementById("track-list").textContent = "Auth failed. Refresh and re-enter password.";
+      listEl.textContent = "Auth failed. Refresh and re-enter password.";
       sessionStorage.removeItem("auth_token");
-      return;
+      throw new Error("auth failed");
+    }
+    return res.json();
+  }
+
+  async function loadSoundtracks() {
+    titleEl.textContent = "My Music";
+    backBtn.style.display = "none";
+    coverEl.style.display = "none";
+    listEl.innerHTML = "Loading...";
+
+    const folders = await authedFetch("/api/soundtracks");
+    listEl.innerHTML = "";
+
+    folders.forEach((folder) => {
+      const li = document.createElement("li");
+      li.textContent = folder;
+      li.onclick = () => loadSoundtrack(folder);
+      listEl.appendChild(li);
+    });
+  }
+
+  async function loadSoundtrack(folder) {
+    titleEl.textContent = folder;
+    backBtn.style.display = "inline-block";
+    listEl.innerHTML = "Loading...";
+
+    const data = await authedFetch("/api/soundtracks/" + encodeURIComponent(folder));
+
+    if (data.cover) {
+      coverEl.src = `${WORKER_URL}/api/stream/${encodeURIComponent(data.cover)}?token=${encodeURIComponent(token)}`;
+      coverEl.style.display = "block";
+    } else {
+      coverEl.style.display = "none";
     }
 
-    const tracks = await res.json();
-    const list = document.getElementById("track-list");
-    list.innerHTML = "";
-
-    tracks.forEach((track) => {
+    listEl.innerHTML = "";
+    data.tracks.forEach((track) => {
       const li = document.createElement("li");
-      li.textContent = track.key;
+      li.textContent = track.name;
       li.onclick = () => playTrack(track.key);
-      list.appendChild(li);
+      listEl.appendChild(li);
     });
   }
 
@@ -56,7 +94,7 @@
     player.play();
   }
 
-  loadTracks();
+  loadSoundtracks();
 </script>
 
 </body>

@@ -23,14 +23,33 @@ export default {
       return new Response("Unauthorized", { status: 401, headers: corsHeaders });
     }
 
-    // GET /api/tracks -> list all objects in the bucket
-    if (path === "/api/tracks") {
-      const listed = await env.MUSIC_BUCKET.list();
-      const tracks = listed.objects.map((obj) => ({
-        key: obj.key,
-        size: obj.size,
-      }));
-      return new Response(JSON.stringify(tracks), {
+    // GET /api/soundtracks -> list top-level folders (each = one soundtrack)
+    if (path === "/api/soundtracks") {
+      const listed = await env.MUSIC_BUCKET.list({ delimiter: "/" });
+      const folders = listed.delimitedPrefixes.map((p) => p.replace(/\/$/, ""));
+      return new Response(JSON.stringify(folders), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // GET /api/soundtracks/<folder> -> list files inside one folder, split into cover image + tracks
+    if (path.startsWith("/api/soundtracks/")) {
+      const folder = decodeURIComponent(path.replace("/api/soundtracks/", ""));
+      const listed = await env.MUSIC_BUCKET.list({ prefix: folder + "/" });
+
+      let cover = null;
+      const tracks = [];
+
+      for (const obj of listed.objects) {
+        const filename = obj.key.split("/").pop();
+        if (/\.(jpg|jpeg|png|webp)$/i.test(filename)) {
+          cover = obj.key;
+        } else if (/\.(mp3|wav|m4a|ogg|flac)$/i.test(filename)) {
+          tracks.push({ key: obj.key, name: filename, size: obj.size });
+        }
+      }
+
+      return new Response(JSON.stringify({ cover, tracks }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
