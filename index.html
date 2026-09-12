@@ -329,6 +329,15 @@
 
   .track-index { width: 20px; color: var(--text-dim); text-align: right; flex-shrink: 0; }
 
+  .track-thumb {
+    width: 28px;
+    height: 28px;
+    object-fit: cover;
+    border-radius: 3px;
+    background: #333;
+    flex-shrink: 0;
+  }
+
   .bottom-bar {
     height: 90px;
     background: #181818;
@@ -1147,6 +1156,7 @@ function App() {
   const viewingSoundtrack = viewingId ? library.soundtracks[viewingId] : null;
   const playingSoundtrack = playingId ? library.soundtracks[playingId] : null;
   const hasNowPlaying = playingSoundtrack && playingKey !== null;
+  const playingTrack = playingSoundtrack ? playingSoundtrack.tracks.find((t) => t.key === playingKey) : null;
 
   return (
     <div className="app">
@@ -1366,7 +1376,7 @@ function App() {
                 <button className="add-tracks-btn" onClick={handleDownload}>Download for offline</button>
               )}
               {viewingSoundtrack.tracks.map((track, i) => {
-                const isPlaying = viewingId === playingId && i === playingIndex;
+                const isPlaying = viewingId === playingId && track.key === playingKey;
                 return (
                   <div
                     key={track.key}
@@ -1375,10 +1385,14 @@ function App() {
                     onDragStart={() => handleTrackDragStart(i)}
                     onDragOver={(e) => e.preventDefault()}
                     onDrop={() => handleTrackDrop(i, viewingSoundtrack.tracks)}
-                    onClick={() => playTrackAt(viewingId, i)}
+                    onClick={() => playTrackAt(viewingId, track.key)}
                     onContextMenu={(e) => openContextMenu(e, { type: "track", id: viewingId, key: track.key })}
                   >
                     <span className="drag-handle">⠿</span>
+                    <img
+                      className="track-thumb"
+                      src={track.cover ? streamUrl(track.cover) : (viewingSoundtrack.cover ? streamUrl(viewingSoundtrack.cover) : "")}
+                    />
                     <span className="track-index">{isPlaying ? "▶" : i + 1}</span>
                     <span>{stripExt(track.name)}</span>
                   </div>
@@ -1395,7 +1409,7 @@ function App() {
             <React.Fragment>
               {playingSoundtrack.cover && <img className="now-playing-cover" src={streamUrl(playingSoundtrack.cover)} />}
               <div style={{minWidth: 0}}>
-                <Marquee text={stripExt(playingSoundtrack.tracks[playingIndex].name)} className="now-playing-track" />
+                <Marquee text={playingTrack ? stripExt(playingTrack.name) : ""} className="now-playing-track" />
                 <Marquee text={playingSoundtrack.name} className="now-playing-folder" />
               </div>
             </React.Fragment>
