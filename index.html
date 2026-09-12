@@ -144,6 +144,46 @@
 
   .add-form button:disabled { opacity: 0.6; cursor: default; }
 
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+  }
+
+  .modal-panel {
+    background: #181818;
+    border: 1px solid #333;
+    border-radius: 10px;
+    padding: 20px;
+    width: 360px;
+    max-width: 90vw;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .modal-header h3 { margin: 0; font-size: 16px; }
+
+  .modal-close {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .modal-close:hover { color: var(--text); }
+
   .lookup-buttons { display: flex; gap: 6px; }
   .lookup-buttons button { flex: 1; }
 
@@ -396,6 +436,23 @@
 
   .play-pause-btn:disabled { opacity: 0.4; cursor: default; }
 
+  .skip-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+  }
+
+  .skip-btn:hover:not(:disabled) { color: var(--text); }
+  .skip-btn:disabled { opacity: 0.3; cursor: default; }
+
   .transport {
     flex: 1;
     display: flex;
@@ -523,6 +580,7 @@
   ::-webkit-scrollbar { width: 10px; }
   ::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 6px; }
 </style>
+</style>
 </head>
 <body>
 
@@ -571,16 +629,18 @@ function Marquee({ text, className }) {
 
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem("auth_token") || "");
-  const [library, setLibrary] = useState({ soundtracks: {}, categories: [], order: {} });
-  const [expanded, setExpanded] = useState({});
+  const [library, setLibrary] = useState({ soundtracks: {}, folders: {}, order: {}, playlists: {} });
+  const [expanded, setExpanded] = useState({}); // folder id -> bool
 
   const [viewingId, setViewingId] = useState(null);
+  const [viewingPlaylistId, setViewingPlaylistId] = useState(null);
   const [error, setError] = useState(null);
   const [isViewingDownloaded, setIsViewingDownloaded] = useState(false);
-  const [downloadStatus, setDownloadStatus] = useState(null); // e.g. "3 / 8" while downloading, null otherwise
+  const [downloadStatus, setDownloadStatus] = useState(null);
 
   const [playingId, setPlayingId] = useState(null);
-  const [playingKey, setPlayingKey] = useState(null); // track.key of the currently playing track, not its position
+  const [playingKey, setPlayingKey] = useState(null);
+  const [playingPlaylistId, setPlayingPlaylistId] = useState(null); // set when the current track came from a playlist queue
   const [loopTrack, setLoopTrack] = useState(false);
   const [shuffle, setShuffle] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -593,6 +653,18 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
 
   const audioRef = useRef(null);
+
+  function openSoundtrack(id) {
+    setViewingId(id);
+    setViewingPlaylistId(null);
+    setShowMetaResults(false);
+    setMetaResults([]);
+  }
+
+  function openPlaylist(id) {
+    setViewingPlaylistId(id);
+    setViewingId(null);
+  }
 
   function streamUrl(key) {
     return `${WORKER_URL}/api/stream/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
@@ -628,6 +700,26 @@ function App() {
     loadLibrary();
   }, [token]);
 
+  // if the thing currently being viewed/played gets deleted (directly, or via a parent folder
+  // getting deleted), clear that state once the library refreshes
+  useEffect(() => {
+    if (viewingId && !library.soundtracks[viewingId]) setViewingId(null);
+  }, [library.soundtracks, viewingId]);
+
+  useEffect(() => {
+    if (viewingPlaylistId && !library.playlists[viewingPlaylistId]) setViewingPlaylistId(null);
+  }, [library.playlists, viewingPlaylistId]);
+
+  useEffect(() => {
+    if (playingId && !library.soundtracks[playingId]) {
+      setPlayingId(null);
+      setPlayingKey(null);
+      if (audioRef.current) audioRef.current.pause();
+    }
+  }, [library.soundtracks, playingId]);
+
+  // ---- offline downloads ----
+
   const OFFLINE_CACHE = "music-offline-v1";
   const lastBlobUrlRef = useRef(null);
 
@@ -651,16 +743,12 @@ function App() {
       await cache.put(keys[i], res.clone());
       if (onProgress) onProgress(i + 1, keys.length);
     }
-    if (navigator.storage && navigator.storage.persist) {
-      navigator.storage.persist(); // ask the browser not to evict this under storage pressure
-    }
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
   }
 
   async function removeDownload(soundtrack) {
     const cache = await caches.open(OFFLINE_CACHE);
-    for (const key of offlineKeys(soundtrack)) {
-      await cache.delete(key);
-    }
+    for (const key of offlineKeys(soundtrack)) await cache.delete(key);
   }
 
   async function getPlayableUrl(key) {
@@ -673,6 +761,8 @@ function App() {
     return streamUrl(key);
   }
 
+  // ---- uploads ----
+
   async function uploadFile(id, file) {
     await authedFetch("/api/upload?id=" + encodeURIComponent(id), {
       method: "POST",
@@ -682,33 +772,28 @@ function App() {
   }
 
   const [showAddForm, setShowAddForm] = useState(false);
-  const [newCategory, setNewCategory] = useState("");
+  const [newParentId, setNewParentId] = useState("");
   const [newName, setNewName] = useState("");
   const [newFiles, setNewFiles] = useState(null);
   const [uploading, setUploading] = useState(false);
 
   const [onlineResults, setOnlineResults] = useState([]);
   const [onlineSearching, setOnlineSearching] = useState(false);
-  const [selectedOnline, setSelectedOnline] = useState(null); // { coverUrl, artist, year, name }
+  const [selectedOnline, setSelectedOnline] = useState(null);
 
   async function handleSearchOnline() {
     if (!newName) return;
     setOnlineSearching(true);
     setOnlineResults([]);
     try {
-      const res = await fetch(
-        "https://itunes.apple.com/search?term=" + encodeURIComponent(newName) + "&entity=album&limit=6"
-      );
+      const res = await fetch("https://itunes.apple.com/search?term=" + encodeURIComponent(newName) + "&entity=album&limit=6");
       const data = await res.json();
-      setOnlineResults(
-        (data.results || []).map((r) => ({
-          name: r.collectionName,
-          artist: r.artistName,
-          year: r.releaseDate ? r.releaseDate.slice(0, 4) : null,
-          // request higher-res artwork than the default 100x100 thumbnail
-          coverUrl: r.artworkUrl100 ? r.artworkUrl100.replace("100x100bb", "600x600bb") : null,
-        }))
-      );
+      setOnlineResults((data.results || []).map((r) => ({
+        name: r.collectionName,
+        artist: r.artistName,
+        year: r.releaseDate ? r.releaseDate.slice(0, 4) : null,
+        coverUrl: r.artworkUrl100 ? r.artworkUrl100.replace("100x100bb", "600x600bb") : null,
+      })));
     } catch (e) {
       alert("Online search failed: " + e.message);
     } finally {
@@ -746,11 +831,10 @@ function App() {
       const { id } = await authedFetch("/api/create-soundtrack", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newName, category: newCategory || null }),
+        body: JSON.stringify({ name: newName, parentId: newParentId || null }),
       });
-      for (const file of newFiles) {
-        await uploadFile(id, file);
-      }
+      for (const file of newFiles) await uploadFile(id, file);
+
       if (selectedOnline) {
         if (selectedOnline.coverUrl) {
           try {
@@ -758,7 +842,7 @@ function App() {
             const blob = await imgRes.blob();
             const coverFile = new File([blob], "cover.jpg", { type: blob.type || "image/jpeg" });
             await uploadFile(id, coverFile);
-          } catch (e) { /* cover fetch failed, skip silently - not critical */ }
+          } catch (e) { /* cover fetch failed, skip silently */ }
         }
         await authedFetch("/api/update-metadata", {
           method: "POST",
@@ -766,8 +850,9 @@ function App() {
           body: JSON.stringify({ id, artist: selectedOnline.artist, year: selectedOnline.year }),
         });
       }
+
       setShowAddForm(false);
-      setNewCategory("");
+      setNewParentId("");
       setNewName("");
       setNewFiles(null);
       setSelectedOnline(null);
@@ -784,14 +869,216 @@ function App() {
     if (!viewingId || !fileList || fileList.length === 0) return;
     setUploading(true);
     try {
-      for (const file of fileList) {
-        await uploadFile(viewingId, file);
-      }
+      for (const file of fileList) await uploadFile(viewingId, file);
       loadLibrary();
     } catch (e) {
       alert("Upload failed: " + e.message);
     } finally {
       setUploading(false);
+    }
+  }
+
+  // ---- folders / playlists / soundtracks: create, rename, move, delete ----
+
+  async function handleCreateFolder(parentId) {
+    const name = prompt("New folder name:");
+    if (!name) return;
+    await authedFetch("/api/create-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, parentId: parentId || null }),
+    });
+    loadLibrary();
+  }
+
+  async function handleRenameFolder(id) {
+    const current = library.folders[id] ? library.folders[id].name : "";
+    const name = prompt("New folder name:", current);
+    if (!name || name === current) return;
+    await authedFetch("/api/rename-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name }),
+    });
+    loadLibrary();
+  }
+
+  async function handleCreatePlaylist(parentId) {
+    const name = prompt("New playlist name:");
+    if (!name) return;
+    await authedFetch("/api/create-playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, parentId: parentId || null }),
+    });
+    loadLibrary();
+  }
+
+  async function handleRenamePlaylist(id) {
+    const current = library.playlists[id] ? library.playlists[id].name : "";
+    const name = prompt("New playlist name:", current);
+    if (!name || name === current) return;
+    await authedFetch("/api/rename-playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name }),
+    });
+    loadLibrary();
+  }
+
+  async function handleAddToPlaylist(playlistId, soundtrackId, key) {
+    await authedFetch("/api/add-to-playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ playlistId, soundtrackId, key }),
+    });
+    loadLibrary();
+  }
+
+  async function handleRemoveFromPlaylist(playlistId, soundtrackId, key) {
+    await authedFetch("/api/remove-from-playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ playlistId, soundtrackId, key }),
+    });
+    loadLibrary();
+  }
+
+  async function handleCreatePlaylistAndAdd(soundtrackId, key) {
+    const name = prompt("New playlist name:");
+    if (!name) return;
+    const { id } = await authedFetch("/api/create-playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, parentId: null }),
+    });
+    await handleAddToPlaylist(id, soundtrackId, key);
+  }
+
+  // searches one source at a time, using whatever query text the person has typed/edited
+  async function searchSource(source, query) {
+    if (source === "itunes") {
+      const res = await fetch("https://itunes.apple.com/search?term=" + encodeURIComponent(query) + "&entity=album&limit=6");
+      const data = await res.json();
+      return (data.results || []).map((r) => ({
+        source: "iTunes",
+        name: r.collectionName,
+        artist: r.artistName,
+        year: r.releaseDate ? r.releaseDate.slice(0, 4) : null,
+        coverUrl: r.artworkUrl100 ? r.artworkUrl100.replace("100x100bb", "600x600bb") : null,
+        description: r.primaryGenreName || null,
+      }));
+    }
+    const igdb = await authedFetch("/api/igdb-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    });
+    return (igdb || []).map((r) => ({ source: "IGDB", name: r.name, artist: null, year: r.year, coverUrl: r.coverUrl, description: r.description }));
+  }
+
+  const [metaQuery, setMetaQuery] = useState("");
+  const [metaResults, setMetaResults] = useState([]);
+  const [metaSearching, setMetaSearching] = useState(false);
+  const [metaSearchAttempted, setMetaSearchAttempted] = useState(false);
+  const [showMetaResults, setShowMetaResults] = useState(false);
+
+  function handleTryGetMeta() {
+    if (!viewingSoundtrack) return;
+    setMetaQuery(viewingSoundtrack.name);
+    setMetaResults([]);
+    setMetaSearchAttempted(false);
+    setShowMetaResults(true);
+  }
+
+  async function handleMetaSearch(source) {
+    if (!metaQuery.trim()) return;
+    setMetaSearching(true);
+    setMetaResults([]);
+    setMetaSearchAttempted(true);
+    try {
+      setMetaResults(await searchSource(source, metaQuery.trim()));
+    } catch (e) {
+      alert("Search failed: " + e.message);
+    } finally {
+      setMetaSearching(false);
+    }
+  }
+
+  async function applyMetaResult(result) {
+    if (!viewingId) return;
+    const soundtrack = library.soundtracks[viewingId];
+
+    // only fill in cover/description if the soundtrack doesn't already have one - never clobber existing data
+    if (result.coverUrl && !(soundtrack && soundtrack.cover)) {
+      try {
+        const imgRes = await fetch(result.coverUrl);
+        const blob = await imgRes.blob();
+        const coverFile = new File([blob], "cover.jpg", { type: blob.type || "image/jpeg" });
+        await uploadFile(viewingId, coverFile);
+      } catch (e) { /* cover fetch failed, still apply the rest below */ }
+    }
+
+    const payload = { id: viewingId, artist: result.artist, year: result.year };
+    if (result.description && !(soundtrack && soundtrack.description)) {
+      payload.description = result.description;
+    }
+    await authedFetch("/api/update-metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    setShowMetaResults(false);
+    setMetaResults([]);
+    loadLibrary();
+  }
+
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editTarget, setEditTarget] = useState(null); // { type: "soundtrack"|"playlist", id }
+  const [editForm, setEditForm] = useState({ name: "", artist: "", year: "", description: "" });
+  const [editCoverFile, setEditCoverFile] = useState(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  function openEditModal(type, id) {
+    const obj = type === "playlist" ? library.playlists[id] : library.soundtracks[id];
+    if (!obj) return;
+    setEditTarget({ type, id });
+    setEditForm({
+      name: obj.name || "",
+      artist: obj.artist || "",
+      year: obj.year || "",
+      description: obj.description || "",
+    });
+    setEditCoverFile(null);
+    setShowEditModal(true);
+  }
+
+  async function handleSaveEdit() {
+    if (!editTarget) return;
+    setSavingEdit(true);
+    try {
+      if (editCoverFile) await uploadFile(editTarget.id, editCoverFile);
+      const payload = {
+        itemType: editTarget.type,
+        id: editTarget.id,
+        name: editForm.name,
+        description: editForm.description,
+      };
+      if (editTarget.type === "soundtrack") {
+        payload.artist = editForm.artist;
+        payload.year = editForm.year;
+      }
+      await authedFetch("/api/update-metadata", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setShowEditModal(false);
+      loadLibrary();
+    } catch (e) {
+      alert("Save failed: " + e.message);
+    } finally {
+      setSavingEdit(false);
     }
   }
 
@@ -807,42 +1094,13 @@ function App() {
     loadLibrary();
   }
 
-  async function handleRenameCategory(oldName) {
-    const newName = prompt("New category name:", oldName);
-    if (!newName || newName === oldName) return;
-    await authedFetch("/api/rename-category", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ oldName, newName }),
-    });
-    loadLibrary();
-  }
-
-  async function handleCreateCategory() {
-    const name = prompt("New category name:");
-    if (!name) return;
-    await authedFetch("/api/create-category", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    loadLibrary();
-  }
-
-  // moving is now instant - just a metadata update, no file copying
-  async function moveSoundtrackToCategory(id, toCategory) {
+  async function moveItem(itemType, id, parentId) {
     await authedFetch("/api/move", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, category: toCategory || null }),
+      body: JSON.stringify({ itemType, id, parentId: parentId || null }),
     });
     loadLibrary();
-  }
-
-  async function handleMoveToCategory(id) {
-    const targetCategory = prompt("Move to which category? (leave blank for top level)");
-    if (targetCategory === null) return;
-    await moveSoundtrackToCategory(id, targetCategory);
   }
 
   async function handleRenameTrack(id, key) {
@@ -877,9 +1135,12 @@ function App() {
   }
 
   async function handleDelete(target) {
-    const label = target.type === "category"
-      ? `category "${target.name}" and everything in it`
-      : `"${library.soundtracks[target.id] ? library.soundtracks[target.id].name : ''}"`;
+    const label =
+      target.type === "folder"
+        ? `folder "${library.folders[target.id] ? library.folders[target.id].name : ""}" and everything inside it`
+        : target.type === "playlist"
+        ? `playlist "${library.playlists[target.id] ? library.playlists[target.id].name : ""}"`
+        : `"${library.soundtracks[target.id] ? library.soundtracks[target.id].name : ""}"`;
     if (!confirm(`Delete ${label}? This cannot be undone.`)) return;
 
     await authedFetch("/api/delete", {
@@ -887,13 +1148,6 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(target),
     });
-
-    if (target.type === "soundtrack" && viewingId === target.id) setViewingId(null);
-    if (target.type === "soundtrack" && playingId === target.id) {
-      setPlayingId(null);
-      setPlayingKey(null);
-      if (audioRef.current) audioRef.current.pause();
-    }
     loadLibrary();
   }
 
@@ -913,23 +1167,26 @@ function App() {
   }
 
   const allSoundtracks = Object.values(library.soundtracks);
-  const directSoundtracks = allSoundtracks.filter((s) => !s.category);
-  const categoriesWithSoundtracks = library.categories.map((name) => ({
-    name,
-    soundtracks: allSoundtracks.filter((s) => s.category === name),
-  }));
 
-  const topLevelItems = applyOrder(
-    [
-      ...categoriesWithSoundtracks.map((c) => ({ type: "category", name: c.name, soundtracks: c.soundtracks })),
-      ...directSoundtracks.map((s) => ({ type: "soundtrack", id: s.id, name: s.name, cover: s.cover })),
-    ],
-    library.order[""] || [],
-    (item) => (item.type === "category" ? item.name : item.id)
-  );
+  const viewingPlaylist = viewingPlaylistId ? library.playlists[viewingPlaylistId] : null;
+  const viewingPlaylistTracks = viewingPlaylist
+    ? viewingPlaylist.tracks
+        .map((ref) => {
+          const soundtrack = library.soundtracks[ref.soundtrackId];
+          const track = soundtrack && soundtrack.tracks.find((t) => t.key === ref.key);
+          return track ? { soundtrackId: ref.soundtrackId, soundtrack, track } : null;
+        })
+        .filter(Boolean)
+    : [];
 
   const pinnedIds = library.order["_pinned"] || [];
-  const pinnedItems = pinnedIds.map((id) => library.soundtracks[id]).filter(Boolean);
+  const pinnedItems = pinnedIds
+    .map((id) => {
+      if (library.soundtracks[id]) return { type: "soundtrack", ...library.soundtracks[id] };
+      if (library.playlists[id]) return { type: "playlist", ...library.playlists[id] };
+      return null;
+    })
+    .filter(Boolean);
 
   const searchResults = (() => {
     const q = searchQuery.trim().toLowerCase();
@@ -951,44 +1208,299 @@ function App() {
     return [...soundtrackMatches, ...trackMatches];
   })();
 
-  // drag-and-drop
+  // ---- drag and drop ----
+  // dragRef stores { parentPath, index, meta: { type, id } } of the item currently being dragged.
+  // parentPath is "" for top level, or a folder id for anything nested inside a folder.
   const dragRef = useRef(null);
 
   function handleDragStart(parentPath, index, meta) {
     dragRef.current = { parentPath, index, meta };
   }
 
-  function handleDragOver(e) { e.preventDefault(); }
+  function handleDragOver(e) {
+    e.preventDefault();
+  }
 
-  function handleDrop(parentPath, displayedItems, getKey, dropIndex) {
+  // dropping between/onto items in the SAME list -> pure reorder
+  function handleDropReorder(parentPath, displayedItems, dropIndex) {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag || drag.parentPath !== parentPath || drag.index === dropIndex) return;
     const newItems = [...displayedItems];
     const [moved] = newItems.splice(drag.index, 1);
     newItems.splice(dropIndex, 0, moved);
-    updateOrder(parentPath, newItems.map(getKey));
+    updateOrder(parentPath, newItems.map((it) => it.id));
   }
 
-  function handleDropOnCategory(categoryName, dropIndex) {
+  // dropping directly onto a folder row -> move soundtracks/playlists into that folder;
+  // dropping a folder onto a folder either reorders (same list) or nests it inside (different list)
+  function handleDropOnFolder(targetFolderId, parentPath, displayedItems, dropIndex) {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
 
-    if (drag.meta && drag.meta.type === "soundtrack") {
-      moveSoundtrackToCategory(drag.meta.id, categoryName);
+    if (drag.meta.type === "soundtrack" || drag.meta.type === "playlist") {
+      moveItem(drag.meta.type, drag.meta.id, targetFolderId);
       return;
     }
 
-    if (drag.parentPath !== "" || drag.index === dropIndex) return;
-    const newItems = [...topLevelItems];
-    const [moved] = newItems.splice(drag.index, 1);
-    newItems.splice(dropIndex, 0, moved);
-    updateOrder("", newItems.map((it) => (it.type === "category" ? it.name : it.id)));
+    if (drag.meta.type === "folder") {
+      if (drag.meta.id === targetFolderId) return;
+      if (drag.parentPath === parentPath && drag.index !== dropIndex) {
+        const newItems = [...displayedItems];
+        const [moved] = newItems.splice(drag.index, 1);
+        newItems.splice(dropIndex, 0, moved);
+        updateOrder(parentPath, newItems.map((it) => it.id));
+      } else {
+        moveItem("folder", drag.meta.id, targetFolderId);
+      }
+    }
   }
 
+  function toggleFolder(id) {
+    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  // recursively renders everything inside the given parentId ("" / null = top level)
+  function renderItems(parentId, indentLevel) {
+    const key = parentId || "";
+    const childFolders = Object.values(library.folders).filter((f) => (f.parentId || null) === (parentId || null));
+    const childSoundtracks = allSoundtracks.filter((s) => (s.parentId || null) === (parentId || null));
+    const childPlaylists = Object.values(library.playlists).filter((pl) => (pl.parentId || null) === (parentId || null));
+
+    const items = applyOrder(
+      [
+        ...childFolders.map((f) => ({ type: "folder", id: f.id, name: f.name })),
+        ...childSoundtracks.map((s) => ({ type: "soundtrack", id: s.id, name: s.name, cover: s.cover })),
+        ...childPlaylists.map((pl) => ({ type: "playlist", id: pl.id, name: pl.name, cover: pl.cover })),
+      ],
+      library.order[key] || [],
+      (item) => item.id
+    );
+
+    return items.map((item, i) => {
+      const meta = { type: item.type, id: item.id };
+      const style = { paddingLeft: 8 + indentLevel * 16 };
+
+      if (item.type === "folder") {
+        const isOpen = !!expanded[item.id];
+        return (
+          <React.Fragment key={item.id}>
+            <div
+              className="folder-item"
+              style={style}
+              draggable
+              onDragStart={() => handleDragStart(key, i, meta)}
+              onDragOver={handleDragOver}
+              onDrop={() => handleDropOnFolder(item.id, key, items, i)}
+              onClick={() => toggleFolder(item.id)}
+              onContextMenu={(e) => openContextMenu(e, { type: "folder", id: item.id })}
+            >
+              <span className="drag-handle">⠿</span>
+              <span className="category-arrow">{isOpen ? "▼" : "▶"}</span>
+              <div className="category-icon">📁</div>
+              <span className="folder-name">{item.name}</span>
+            </div>
+            {isOpen && renderItems(item.id, indentLevel + 1)}
+          </React.Fragment>
+        );
+      }
+
+      if (item.type === "playlist") {
+        return (
+          <div
+            key={item.id}
+            className={"folder-item" + (item.id === viewingPlaylistId ? " active" : "")}
+            style={style}
+            draggable
+            onDragStart={() => handleDragStart(key, i, meta)}
+            onDragOver={handleDragOver}
+            onDrop={() => handleDropReorder(key, items, i)}
+            onClick={() => openPlaylist(item.id)}
+            onContextMenu={(e) => openContextMenu(e, { type: "playlist", id: item.id })}
+          >
+            <span className="drag-handle">⠿</span>
+            {item.cover ? (
+              <img className="folder-thumb" src={streamUrl(item.cover)} />
+            ) : (
+              <div className="category-icon">🎶</div>
+            )}
+            <span className="folder-name">{item.name}</span>
+          </div>
+        );
+      }
+
+      // soundtrack
+      return (
+        <div
+          key={item.id}
+          className={"folder-item" + (item.id === viewingId ? " active" : "")}
+          style={style}
+          draggable
+          onDragStart={() => handleDragStart(key, i, meta)}
+          onDragOver={handleDragOver}
+          onDrop={() => handleDropReorder(key, items, i)}
+          onClick={() => openSoundtrack(item.id)}
+          onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: item.id })}
+        >
+          <span className="drag-handle">⠿</span>
+          <img className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
+          <span className="folder-name">{item.name}</span>
+          {item.id === playingId && <div className="folder-playing-dot"></div>}
+        </div>
+      );
+    });
+  }
+
+  // flattened folder list for the "create soundtrack in..." dropdown, indented by depth
+  function flattenFolders(parentId, depth) {
+    return Object.values(library.folders)
+      .filter((f) => (f.parentId || null) === (parentId || null))
+      .flatMap((f) => [{ ...f, depth }, ...flattenFolders(f.id, depth + 1)]);
+  }
+  const folderOptions = flattenFolders(null, 0);
+
+  // ---- playback ----
+
+  function playTrackAt(id, key, playlistId) {
+    const soundtrack = library.soundtracks[id];
+    if (!soundtrack || !soundtrack.tracks.some((t) => t.key === key)) return;
+    setPlayingId(id);
+    setPlayingKey(key);
+    setPlayingPlaylistId(playlistId || null);
+  }
+
+  // picks a random soundtrack sharing the same parent folder, excluding one id, that actually has tracks
+  function pickRandomSiblingSoundtrack(parentId, excludeId) {
+    const candidates = allSoundtracks.filter(
+      (s) => (s.parentId || null) === (parentId || null) && s.id !== excludeId && s.tracks.length > 0
+    );
+    if (candidates.length === 0) return null;
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  useEffect(() => {
+    const soundtrack = playingId && library.soundtracks[playingId];
+    const track = soundtrack && soundtrack.tracks.find((t) => t.key === playingKey);
+    if (track && audioRef.current) {
+      let cancelled = false;
+      getPlayableUrl(track.key).then((url) => {
+        if (cancelled) return;
+        if (lastBlobUrlRef.current) {
+          URL.revokeObjectURL(lastBlobUrlRef.current);
+          lastBlobUrlRef.current = null;
+        }
+        if (url.startsWith("blob:")) lastBlobUrlRef.current = url;
+        audioRef.current.src = url;
+        audioRef.current.play();
+      });
+      return () => { cancelled = true; };
+    }
+  }, [playingKey, playingId]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.loop = loopTrack;
+  }, [loopTrack]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = Math.pow(volumePercent / 100, 2);
+    localStorage.setItem("volumePercent", volumePercent);
+  }, [volumePercent]);
+
+  const [volumeInput, setVolumeInput] = useState(null);
+
+  function commitVolumeInput() {
+    if (volumeInput === null) return;
+    const parsed = parseInt(volumeInput, 10);
+    if (!isNaN(parsed)) setVolumePercent(Math.max(0, Math.min(100, parsed)));
+    setVolumeInput(null);
+  }
+
+  function handleSeek(value) {
+    if (audioRef.current) audioRef.current.currentTime = value;
+    setCurrentTime(value);
+  }
+
+  function togglePlayPause() {
+    if (!audioRef.current) return;
+    if (audioRef.current.paused) audioRef.current.play();
+    else audioRef.current.pause();
+  }
+
+  function formatTime(sec) {
+    if (!sec || isNaN(sec)) return "0:00";
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60).toString().padStart(2, "0");
+    return `${m}:${s}`;
+  }
+
+  function handlePrevious() {
+    if (playingPlaylistId) {
+      const playlist = library.playlists[playingPlaylistId];
+      if (!playlist) return;
+      const refs = playlist.tracks;
+      const currentIdx = refs.findIndex((t) => t.soundtrackId === playingId && t.key === playingKey);
+      const prev = refs[currentIdx - 1];
+      if (prev && library.soundtracks[prev.soundtrackId]) {
+        playTrackAt(prev.soundtrackId, prev.key, playingPlaylistId);
+      }
+      return;
+    }
+
+    const soundtrack = playingId && library.soundtracks[playingId];
+    if (!soundtrack) return;
+    const currentIndex = soundtrack.tracks.findIndex((t) => t.key === playingKey);
+    const prevTrack = soundtrack.tracks[currentIndex - 1];
+    if (prevTrack) playTrackAt(playingId, prevTrack.key);
+  }
+
+  function handleEnded() {
+    if (loopTrack) return;
+
+    if (playingPlaylistId) {
+      const playlist = library.playlists[playingPlaylistId];
+      if (playlist) {
+        const refs = playlist.tracks;
+        const currentIdx = refs.findIndex((t) => t.soundtrackId === playingId && t.key === playingKey);
+        const next = refs[currentIdx + 1];
+        if (next && library.soundtracks[next.soundtrackId] && library.soundtracks[next.soundtrackId].tracks.some((t) => t.key === next.key)) {
+          playTrackAt(next.soundtrackId, next.key, playingPlaylistId);
+          return;
+        }
+        // playlist finished - continue with a random soundtrack from the same folder
+        const sibling = pickRandomSiblingSoundtrack(playlist.parentId, null);
+        if (sibling) playTrackAt(sibling.id, sibling.tracks[Math.floor(Math.random() * sibling.tracks.length)].key, null);
+      }
+      return;
+    }
+
+    const soundtrack = playingId && library.soundtracks[playingId];
+    if (!soundtrack) return;
+    const currentIndex = soundtrack.tracks.findIndex((t) => t.key === playingKey);
+
+    if (shuffle && soundtrack.tracks.length > 1) {
+      let nextIndex;
+      do {
+        nextIndex = Math.floor(Math.random() * soundtrack.tracks.length);
+      } while (nextIndex === currentIndex);
+      playTrackAt(playingId, soundtrack.tracks[nextIndex].key);
+      return;
+    }
+
+    const nextTrack = soundtrack.tracks[currentIndex + 1];
+    if (nextTrack) {
+      playTrackAt(playingId, nextTrack.key);
+      return;
+    }
+
+    // reached the end of this soundtrack - continue with a random soundtrack from the same folder, if any
+    const sibling = pickRandomSiblingSoundtrack(soundtrack.parentId, soundtrack.id);
+    if (sibling) playTrackAt(sibling.id, sibling.tracks[Math.floor(Math.random() * sibling.tracks.length)].key);
+  }
+
+  // ---- track reordering ----
+
   async function reorderTracks(id, order) {
-    // optimistic update so it feels instant
     setLibrary((prev) => {
       const soundtrack = prev.soundtracks[id];
       if (!soundtrack) return prev;
@@ -1020,9 +1532,7 @@ function App() {
     reorderTracks(viewingId, newTracks.map((t) => t.key));
   }
 
-  function toggleCategory(name) {
-    setExpanded((prev) => ({ ...prev, [name]: !prev[name] }));
-  }
+  // ---- downloads for currently viewed soundtrack ----
 
   const viewingSoundtrackForEffect = viewingId ? library.soundtracks[viewingId] : null;
 
@@ -1052,93 +1562,13 @@ function App() {
     setIsViewingDownloaded(false);
   }
 
-  function playTrackAt(id, key) {
-    const soundtrack = library.soundtracks[id];
-    if (!soundtrack || !soundtrack.tracks.some((t) => t.key === key)) return;
-    setPlayingId(id);
-    setPlayingKey(key);
-  }
-
-  useEffect(() => {
-    const soundtrack = playingId && library.soundtracks[playingId];
-    const track = soundtrack && soundtrack.tracks.find((t) => t.key === playingKey);
-    if (track && audioRef.current) {
-      let cancelled = false;
-      getPlayableUrl(track.key).then((url) => {
-        if (cancelled) return;
-        if (lastBlobUrlRef.current) {
-          URL.revokeObjectURL(lastBlobUrlRef.current);
-          lastBlobUrlRef.current = null;
-        }
-        if (url.startsWith("blob:")) lastBlobUrlRef.current = url;
-        audioRef.current.src = url;
-        audioRef.current.play();
-      });
-      return () => { cancelled = true; };
-    }
-  }, [playingKey, playingId]);
-
-  useEffect(() => {
-    if (audioRef.current) audioRef.current.loop = loopTrack;
-  }, [loopTrack]);
-
-  // slider position (0-100) maps to actual volume via a curve, since loudness perception is roughly
-  // logarithmic - a straight linear mapping makes the top half of the slider feel like it does nothing
-  useEffect(() => {
-    if (audioRef.current) audioRef.current.volume = Math.pow(volumePercent / 100, 2);
-    localStorage.setItem("volumePercent", volumePercent);
-  }, [volumePercent]);
-
-  const [volumeInput, setVolumeInput] = useState(null); // string while editing, null when not
-
-  function commitVolumeInput() {
-    if (volumeInput === null) return;
-    const parsed = parseInt(volumeInput, 10);
-    if (!isNaN(parsed)) setVolumePercent(Math.max(0, Math.min(100, parsed)));
-    setVolumeInput(null);
-  }
-
-  function handleSeek(value) {
-    if (audioRef.current) audioRef.current.currentTime = value;
-    setCurrentTime(value);
-  }
-
-  function togglePlayPause() {
-    if (!audioRef.current) return;
-    if (audioRef.current.paused) audioRef.current.play();
-    else audioRef.current.pause();
-  }
-
-  function formatTime(sec) {
-    if (!sec || isNaN(sec)) return "0:00";
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60).toString().padStart(2, "0");
-    return `${m}:${s}`;
-  }
-
-  function handleEnded() {
-    if (loopTrack) return;
-    const soundtrack = playingId && library.soundtracks[playingId];
-    if (!soundtrack) return;
-    const currentIndex = soundtrack.tracks.findIndex((t) => t.key === playingKey);
-
-    if (shuffle && soundtrack.tracks.length > 1) {
-      let nextIndex;
-      do {
-        nextIndex = Math.floor(Math.random() * soundtrack.tracks.length);
-      } while (nextIndex === currentIndex);
-      playTrackAt(playingId, soundtrack.tracks[nextIndex].key);
-      return;
-    }
-
-    const nextTrack = soundtrack.tracks[currentIndex + 1];
-    if (nextTrack) playTrackAt(playingId, nextTrack.key);
-  }
+  // ---- context menu ----
 
   const [contextMenu, setContextMenu] = useState(null);
+  const [playlistPickerFor, setPlaylistPickerFor] = useState(null);
 
   useEffect(() => {
-    function closeMenu() { setContextMenu(null); }
+    function closeMenu() { setContextMenu(null); setPlaylistPickerFor(null); }
     window.addEventListener("click", closeMenu);
     return () => window.removeEventListener("click", closeMenu);
   }, []);
@@ -1162,7 +1592,18 @@ function App() {
     <div className="app">
       <div className="app-body">
 
-        <div className="sidebar" onContextMenu={(e) => openContextMenu(e, { type: "empty" })}>
+        <div
+          className="sidebar"
+          onContextMenu={(e) => openContextMenu(e, { type: "empty" })}
+          onDragOver={handleDragOver}
+          onDrop={() => {
+            // only fires if no nested item's own onDrop already handled and cleared the drag (see handleDrop*),
+            // so this only triggers for drops on truly empty sidebar space - moves the dragged item to the top level
+            const drag = dragRef.current;
+            dragRef.current = null;
+            if (drag) moveItem(drag.meta.type, drag.meta.id, null);
+          }}
+        >
           <div className="sidebar-header">
             <h1>Library</h1>
             <button className="add-btn" onClick={() => setShowAddForm(!showAddForm)}>+</button>
@@ -1176,14 +1617,17 @@ function App() {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
             />
-            {searchQuery && (
-              <button className="search-clear-btn" onClick={() => setSearchQuery("")}>✕</button>
-            )}
+            {searchQuery && <button className="search-clear-btn" onClick={() => setSearchQuery("")}>✕</button>}
           </div>
 
           {showAddForm && (
             <div className="add-form">
-              <input type="text" placeholder="Category (optional)" value={newCategory} onChange={(e) => setNewCategory(e.target.value)} />
+              <select value={newParentId} onChange={(e) => setNewParentId(e.target.value)}>
+                <option value="">(Top level)</option>
+                {folderOptions.map((f) => (
+                  <option key={f.id} value={f.id}>{"—".repeat(f.depth) + " " + f.name}</option>
+                ))}
+              </select>
               <input type="text" placeholder="Soundtrack name" value={newName} onChange={(e) => setNewName(e.target.value)} />
 
               <div className="lookup-buttons">
@@ -1228,14 +1672,14 @@ function App() {
           {searchResults ? (
             <React.Fragment>
               <div className="section-label">{searchResults.length} result{searchResults.length === 1 ? "" : "s"}</div>
-              {searchResults.map((r, i) => {
+              {searchResults.map((r) => {
                 if (r.kind === "soundtrack") {
                   const s = r.soundtrack;
                   return (
                     <div
                       key={"search-st-" + s.id}
                       className={"folder-item" + (s.id === viewingId ? " active" : "")}
-                      onClick={() => setViewingId(s.id)}
+                      onClick={() => openSoundtrack(s.id)}
                       onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: s.id })}
                     >
                       <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
@@ -1244,13 +1688,12 @@ function App() {
                     </div>
                   );
                 }
-                // track result
                 const s = r.soundtrack;
                 return (
                   <div
                     key={"search-tr-" + r.track.key}
                     className="folder-item"
-                    onClick={() => { setViewingId(s.id); playTrackAt(s.id, r.track.key); }}
+                    onClick={() => { openSoundtrack(s.id); playTrackAt(s.id, r.track.key); }}
                   >
                     <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
                     <div style={{ minWidth: 0, overflow: "hidden" }}>
@@ -1267,87 +1710,80 @@ function App() {
               {pinnedItems.length > 0 && (
                 <React.Fragment>
                   <div className="section-label">Pinned</div>
-                  {pinnedItems.map((s) => (
+                  {pinnedItems.map((p) => (
                     <div
-                      key={"pin-" + s.id}
-                      className={"folder-item" + (s.id === viewingId ? " active" : "")}
-                      onClick={() => setViewingId(s.id)}
-                      onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: s.id })}
+                      key={"pin-" + p.id}
+                      className={"folder-item" + ((p.type === "soundtrack" ? p.id === viewingId : p.id === viewingPlaylistId) ? " active" : "")}
+                      onClick={() => (p.type === "soundtrack" ? openSoundtrack(p.id) : openPlaylist(p.id))}
+                      onContextMenu={(e) => openContextMenu(e, { type: p.type, id: p.id })}
                     >
-                      <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
-                      <span className="folder-name">{s.name}</span>
-                      {s.id === playingId && <div className="folder-playing-dot"></div>}
+                      {p.type === "soundtrack" ? (
+                        <img className="folder-thumb" src={p.cover ? streamUrl(p.cover) : ""} />
+                      ) : p.cover ? (
+                        <img className="folder-thumb" src={streamUrl(p.cover)} />
+                      ) : (
+                        <div className="category-icon">🎶</div>
+                      )}
+                      <span className="folder-name">{p.name}</span>
+                      {p.type === "soundtrack" && p.id === playingId && <div className="folder-playing-dot"></div>}
                     </div>
                   ))}
-                  <div className="section-label">All</div>
                 </React.Fragment>
               )}
 
-              {topLevelItems.map((item, i) => {
-                if (item.type === "category") {
-                  const isOpen = !!expanded[item.name];
-                  const nestedItems = applyOrder(item.soundtracks, library.order[item.name] || [], (s) => s.id);
-                  return (
-                    <React.Fragment key={item.name}>
-                      <div
-                        className="folder-item"
-                        draggable
-                        onDragStart={() => handleDragStart("", i, { type: "category", name: item.name })}
-                        onDragOver={handleDragOver}
-                        onDrop={() => handleDropOnCategory(item.name, i)}
-                        onClick={() => toggleCategory(item.name)}
-                        onContextMenu={(e) => openContextMenu(e, { type: "category", name: item.name })}
-                      >
-                        <span className="drag-handle">⠿</span>
-                        <span className="category-arrow">{isOpen ? "▼" : "▶"}</span>
-                        <div className="category-icon">📁</div>
-                        <span className="folder-name">{item.name}</span>
-                      </div>
-                      {isOpen && nestedItems.map((s, j) => (
-                        <div
-                          key={s.id}
-                          className={"folder-item nested" + (s.id === viewingId ? " active" : "")}
-                          draggable
-                          onDragStart={() => handleDragStart(item.name, j, { type: "soundtrack", id: s.id })}
-                          onDragOver={handleDragOver}
-                          onDrop={() => handleDrop(item.name, nestedItems, (it) => it.id, j)}
-                          onClick={() => setViewingId(s.id)}
-                          onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: s.id })}
-                        >
-                          <span className="drag-handle">⠿</span>
-                          <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
-                          <span className="folder-name">{s.name}</span>
-                          {s.id === playingId && <div className="folder-playing-dot"></div>}
-                        </div>
-                      ))}
-                    </React.Fragment>
-                  );
-                }
+              <div className="section-label">All</div>
 
-                return (
-                  <div
-                    key={item.id}
-                    className={"folder-item" + (item.id === viewingId ? " active" : "")}
-                    draggable
-                    onDragStart={() => handleDragStart("", i, { type: "soundtrack", id: item.id })}
-                    onDragOver={handleDragOver}
-                    onDrop={() => handleDrop("", topLevelItems, (it) => (it.type === "category" ? it.name : it.id), i)}
-                    onClick={() => setViewingId(item.id)}
-                    onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: item.id })}
-                  >
-                    <span className="drag-handle">⠿</span>
-                    <img className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
-                    <span className="folder-name">{item.name}</span>
-                    {item.id === playingId && <div className="folder-playing-dot"></div>}
-                  </div>
-                );
-              })}
+              {renderItems(null, 0)}
             </React.Fragment>
           )}
         </div>
 
         <div className="main">
-          {!viewingSoundtrack ? (
+          {viewingPlaylist ? (
+            <React.Fragment>
+              <div className="main-header">
+                {viewingPlaylist.cover ? (
+                  <img className="main-cover" src={streamUrl(viewingPlaylist.cover)} />
+                ) : (
+                  <div className="category-icon main-cover" style={{fontSize: 40, display: "flex", alignItems: "center", justifyContent: "center"}}>🎶</div>
+                )}
+                <div>
+                  <h2 className="main-title">{viewingPlaylist.name}</h2>
+                  {viewingPlaylist.description && (
+                    <div className="main-subtitle" style={{maxWidth: 500}}>{viewingPlaylist.description}</div>
+                  )}
+                </div>
+              </div>
+              <button className="add-tracks-btn" onClick={() => openEditModal("playlist", viewingPlaylistId)}>✏️ Edit</button>
+              {viewingPlaylistTracks.length === 0 ? (
+                <div className="main-empty" style={{marginTop: 20}}>
+                  No tracks yet - right-click any track in your library and choose "Add to playlist...".
+                </div>
+              ) : (
+                viewingPlaylistTracks.map(({ soundtrackId, soundtrack, track }) => {
+                  const isPlaying = soundtrackId === playingId && track.key === playingKey;
+                  return (
+                    <div
+                      key={soundtrackId + ":" + track.key}
+                      className={"track-row" + (isPlaying ? " playing" : "")}
+                      onClick={() => playTrackAt(soundtrackId, track.key, viewingPlaylistId)}
+                      onContextMenu={(e) => openContextMenu(e, { type: "track", id: soundtrackId, key: track.key, playlistId: viewingPlaylistId })}
+                    >
+                      <img
+                        className="track-thumb"
+                        src={track.cover ? streamUrl(track.cover) : (soundtrack.cover ? streamUrl(soundtrack.cover) : "")}
+                      />
+                      <span className="track-index">{isPlaying ? "▶" : "♪"}</span>
+                      <div style={{ minWidth: 0, overflow: "hidden" }}>
+                        <div>{stripExt(track.name)}</div>
+                        <div className="search-subtitle">{soundtrack.name}</div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </React.Fragment>
+          ) : !viewingSoundtrack ? (
             <div className="main-empty">Pick a soundtrack from the left to see its tracks.</div>
           ) : (
             <React.Fragment>
@@ -1359,6 +1795,9 @@ function App() {
                     <div className="main-subtitle">
                       {viewingSoundtrack.artist}{viewingSoundtrack.artist && viewingSoundtrack.year ? " · " : ""}{viewingSoundtrack.year}
                     </div>
+                  )}
+                  {viewingSoundtrack.description && (
+                    <div className="main-subtitle" style={{marginTop: 6, maxWidth: 500}}>{viewingSoundtrack.description}</div>
                   )}
                 </div>
               </div>
@@ -1374,6 +1813,57 @@ function App() {
                 <button className="add-tracks-btn" onClick={handleRemoveDownload}>✓ Downloaded (remove)</button>
               ) : (
                 <button className="add-tracks-btn" onClick={handleDownload}>Download for offline</button>
+              )}
+              {" "}
+              <button className="add-tracks-btn" onClick={() => openEditModal("soundtrack", viewingId)}>✏️ Edit</button>
+              {" "}
+              <button className="add-tracks-btn" onClick={handleTryGetMeta} disabled={metaSearching}>
+                {metaSearching ? "Searching..." : "🔎 Try Get Meta"}
+              </button>
+
+              {showMetaResults && (
+                <div className="modal-backdrop" onClick={() => setShowMetaResults(false)}>
+                  <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+                    <div className="modal-header">
+                      <h3>Find metadata</h3>
+                      <button className="modal-close" onClick={() => setShowMetaResults(false)}>✕</button>
+                    </div>
+                    <input
+                      type="text"
+                      className="search-input"
+                      style={{marginBottom: 8}}
+                      value={metaQuery}
+                      onChange={(e) => setMetaQuery(e.target.value)}
+                      placeholder="Search term..."
+                    />
+                    <div className="lookup-buttons">
+                      <button type="button" onClick={() => handleMetaSearch("itunes")} disabled={!metaQuery.trim() || metaSearching}>
+                        {metaSearching ? "Searching..." : "🎵 iTunes"}
+                      </button>
+                      <button type="button" onClick={() => handleMetaSearch("igdb")} disabled={!metaQuery.trim() || metaSearching}>
+                        {metaSearching ? "Searching..." : "🎮 IGDB"}
+                      </button>
+                    </div>
+                    {metaSearchAttempted && !metaSearching && metaResults.length === 0 && (
+                      <div className="search-subtitle" style={{marginTop: 10}}>No matches found for "{metaQuery}".</div>
+                    )}
+                    {metaResults.length > 0 && (
+                      <div className="online-results" style={{marginTop: 10}}>
+                        {metaResults.map((r, i) => (
+                          <div key={i} className="online-result" onClick={() => applyMetaResult(r)}>
+                            {r.coverUrl && <img src={r.coverUrl} className="online-result-thumb" />}
+                            <div style={{ minWidth: 0 }}>
+                              <div className="online-result-name">{r.name}</div>
+                              <div className="online-result-sub">
+                                {r.source}{r.artist ? ` · ${r.artist}` : ""}{r.year ? ` · ${r.year}` : ""}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
               )}
               {viewingSoundtrack.tracks.map((track, i) => {
                 const isPlaying = viewingId === playingId && track.key === playingKey;
@@ -1417,6 +1907,9 @@ function App() {
             <div className="now-playing-folder">Nothing playing</div>
           )}
         </div>
+
+        <div className="bar-divider"></div>
+
         <audio
           ref={audioRef}
           onEnded={handleEnded}
@@ -1427,11 +1920,13 @@ function App() {
           style={{ display: "none" }}
         ></audio>
 
-        <div className="bar-divider"></div>
+        <button className="skip-btn" onClick={handlePrevious} disabled={!hasNowPlaying}>⏮</button>
 
         <button className="play-pause-btn" onClick={togglePlayPause} disabled={!hasNowPlaying}>
           {isPlaying ? "⏸" : "▶"}
         </button>
+
+        <button className="skip-btn" onClick={handleEnded} disabled={!hasNowPlaying}>⏭</button>
 
         <div className="transport">
           <span className="time-label">{formatTime(currentTime)}</span>
@@ -1486,34 +1981,149 @@ function App() {
         </button>
       </div>
 
+      {showEditModal && editTarget && (
+        <div className="modal-backdrop" onClick={() => setShowEditModal(false)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Edit {editTarget.type}</h3>
+              <button className="modal-close" onClick={() => setShowEditModal(false)}>✕</button>
+            </div>
+
+            <input
+              type="text"
+              className="search-input"
+              style={{marginBottom: 8}}
+              placeholder="Name"
+              value={editForm.name}
+              onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
+            />
+
+            {editTarget.type === "soundtrack" && (
+              <React.Fragment>
+                <input
+                  type="text"
+                  className="search-input"
+                  style={{marginBottom: 8}}
+                  placeholder="Artist"
+                  value={editForm.artist}
+                  onChange={(e) => setEditForm({ ...editForm, artist: e.target.value })}
+                />
+                <input
+                  type="text"
+                  className="search-input"
+                  style={{marginBottom: 8}}
+                  placeholder="Year"
+                  value={editForm.year}
+                  onChange={(e) => setEditForm({ ...editForm, year: e.target.value })}
+                />
+              </React.Fragment>
+            )}
+
+            <textarea
+              className="search-input"
+              style={{marginBottom: 10, minHeight: 70, resize: "vertical", fontFamily: "inherit"}}
+              placeholder="Description"
+              value={editForm.description}
+              onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
+            ></textarea>
+
+            <div style={{marginBottom: 12}}>
+              <label style={{fontSize: 12, color: "var(--text-dim)", display: "block", marginBottom: 4}}>Cover image</label>
+              <input type="file" accept="image/*" onChange={(e) => setEditCoverFile(e.target.files[0])} />
+            </div>
+
+            <button
+              onClick={handleSaveEdit}
+              disabled={savingEdit}
+              style={{width: "100%", background: "var(--accent)", border: "none", color: "#000", padding: 8, borderRadius: 6, fontWeight: 600, cursor: "pointer"}}
+            >
+              {savingEdit ? "Saving..." : "Save"}
+            </button>
+          </div>
+        </div>
+      )}
+
       {contextMenu && (
         <div className="context-menu" style={{top: contextMenu.y, left: contextMenu.x}} onClick={(e) => e.stopPropagation()}>
-          {contextMenu.target.type === "empty" && (
-            <div className="context-item" onClick={handleCreateCategory}>New category folder</div>
-          )}
-          {contextMenu.target.type === "category" && (
+          {playlistPickerFor ? (
             <React.Fragment>
-              <div className="context-item" onClick={() => { setShowAddForm(true); setNewCategory(contextMenu.target.name); }}>
-                Add soundtrack here
+              <div className="context-item" onClick={() => { handleCreatePlaylistAndAdd(playlistPickerFor.id, playlistPickerFor.key); setContextMenu(null); setPlaylistPickerFor(null); }}>
+                + New playlist...
               </div>
-              <div className="context-item" onClick={() => handleRenameCategory(contextMenu.target.name)}>Rename</div>
-              <div className="context-item danger" onClick={() => handleDelete(contextMenu.target)}>Delete category</div>
+              {Object.values(library.playlists).map((pl) => (
+                <div
+                  key={pl.id}
+                  className="context-item"
+                  onClick={() => { handleAddToPlaylist(pl.id, playlistPickerFor.id, playlistPickerFor.key); setContextMenu(null); setPlaylistPickerFor(null); }}
+                >
+                  {pl.name}
+                </div>
+              ))}
             </React.Fragment>
-          )}
-          {contextMenu.target.type === "soundtrack" && (
+          ) : (
             <React.Fragment>
-              <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
-                {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
-              </div>
-              <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
-              <div className="context-item" onClick={() => handleMoveToCategory(contextMenu.target.id)}>Move to category...</div>
-              <div className="context-item danger" onClick={() => handleDelete(contextMenu.target)}>Delete</div>
-            </React.Fragment>
-          )}
-          {contextMenu.target.type === "track" && (
-            <React.Fragment>
-              <div className="context-item" onClick={() => handleRenameTrack(contextMenu.target.id, contextMenu.target.key)}>Rename</div>
-              <div className="context-item danger" onClick={() => handleDeleteTrack(contextMenu.target.id, contextMenu.target.key)}>Delete</div>
+              {contextMenu.target.type === "empty" && (
+                <React.Fragment>
+                  <div className="context-item" onClick={() => handleCreateFolder(null)}>New folder</div>
+                  <div className="context-item" onClick={() => handleCreatePlaylist(null)}>New playlist</div>
+                </React.Fragment>
+              )}
+              {contextMenu.target.type === "folder" && (
+                <React.Fragment>
+                  <div className="context-item" onClick={() => { setShowAddForm(true); setNewParentId(contextMenu.target.id); }}>
+                    Add soundtrack here
+                  </div>
+                  <div className="context-item" onClick={() => handleCreatePlaylist(contextMenu.target.id)}>New playlist here</div>
+                  <div className="context-item" onClick={() => handleCreateFolder(contextMenu.target.id)}>New subfolder here</div>
+                  <div className="context-item" onClick={() => handleRenameFolder(contextMenu.target.id)}>Rename</div>
+                  {library.folders[contextMenu.target.id] && library.folders[contextMenu.target.id].parentId && (
+                    <div className="context-item" onClick={() => moveItem("folder", contextMenu.target.id, null)}>Move to top level</div>
+                  )}
+                  <div className="context-item danger" onClick={() => handleDelete(contextMenu.target)}>Delete folder</div>
+                </React.Fragment>
+              )}
+              {contextMenu.target.type === "soundtrack" && (
+                <React.Fragment>
+                  <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
+                    {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
+                  </div>
+                  <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
+                  {library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].parentId && (
+                    <div className="context-item" onClick={() => moveItem("soundtrack", contextMenu.target.id, null)}>Move to top level</div>
+                  )}
+                  <div className="context-item danger" onClick={() => handleDelete(contextMenu.target)}>Delete</div>
+                </React.Fragment>
+              )}
+              {contextMenu.target.type === "playlist" && (
+                <React.Fragment>
+                  <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
+                    {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
+                  </div>
+                  <div className="context-item" onClick={() => handleRenamePlaylist(contextMenu.target.id)}>Rename</div>
+                  {library.playlists[contextMenu.target.id] && library.playlists[contextMenu.target.id].parentId && (
+                    <div className="context-item" onClick={() => moveItem("playlist", contextMenu.target.id, null)}>Move to top level</div>
+                  )}
+                  <div className="context-item danger" onClick={() => handleDelete(contextMenu.target)}>Delete playlist</div>
+                </React.Fragment>
+              )}
+              {contextMenu.target.type === "track" && (
+                contextMenu.target.playlistId ? (
+                  <div
+                    className="context-item danger"
+                    onClick={() => handleRemoveFromPlaylist(contextMenu.target.playlistId, contextMenu.target.id, contextMenu.target.key)}
+                  >
+                    Remove from playlist
+                  </div>
+                ) : (
+                  <React.Fragment>
+                    <div className="context-item" onClick={() => handleRenameTrack(contextMenu.target.id, contextMenu.target.key)}>Rename</div>
+                    <div className="context-item" onClick={() => setPlaylistPickerFor({ id: contextMenu.target.id, key: contextMenu.target.key })}>
+                      Add to playlist...
+                    </div>
+                    <div className="context-item danger" onClick={() => handleDeleteTrack(contextMenu.target.id, contextMenu.target.key)}>Delete</div>
+                  </React.Fragment>
+                )
+              )}
             </React.Fragment>
           )}
         </div>
@@ -1529,7 +2139,6 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch((e) => console.error("SW registration failed:", e));
   });
 }
-
 </script>
 
 </body>
