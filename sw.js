@@ -5,7 +5,7 @@
 // existing per-soundtrack "Download for offline" feature (Cache Storage API in
 // index.html) handles audio caching separately.
 
-const CACHE_NAME = "app-shell-v1";
+const CACHE_NAME = "app-shell-v2";
 
 const SHELL_FILES = [
   "./",
@@ -39,7 +39,16 @@ self.addEventListener("fetch", (event) => {
   );
   if (!isShellFile) return; // let everything else (API calls, audio streams) go straight to network as usual
 
+  // network-first: always try to get the latest version; only fall back to the cached
+  // copy if the network is unavailable (e.g. offline). This keeps updates from ever
+  // going stale, since we're no longer relying on the cache unless we have to.
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((networkResponse) => {
+        const responseClone = networkResponse.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseClone));
+        return networkResponse;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
