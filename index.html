@@ -7,7 +7,7 @@
 <link rel="icon" href="./icon-192.png">
 <link rel="apple-touch-icon" href="./icon-192.png">
 <meta name="theme-color" content="#121212">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <style>
   :root {
     --bg: #121212;
@@ -27,12 +27,13 @@
     background: var(--bg);
     color: var(--text);
     height: 100vh;
+    height: 100dvh;
     overflow: hidden;
   }
 
-  #root { height: 100vh; }
+  #root { height: 100vh; height: 100dvh; }
 
-  .app { display: flex; flex-direction: column; height: 100vh; }
+  .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
   .app-body { display: flex; flex: 1; min-height: 0; }
 
   .sidebar {
@@ -577,6 +578,79 @@
   .context-item.danger { color: #f87171; }
   .context-item.danger:hover { background: rgba(248,113,113,0.1); }
 
+
+  .mobile-topbar, .drawer-backdrop { display: none; }
+
+  @media (max-width: 700px) {
+    body { -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+    .mobile-topbar {
+      display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+      padding: 8px 12px; padding-top: calc(8px + env(safe-area-inset-top, 0px));
+      background: #000; border-bottom: 1px solid #282828;
+    }
+    .mobile-menu-btn {
+      background: transparent; border: 1px solid #444; color: var(--text);
+      border-radius: 16px; padding: 6px 14px; font-size: 13px; font-family: inherit;
+    }
+    .mobile-topbar-title { font-size: 14px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .sidebar {
+      position: fixed; top: 0; bottom: 0; left: 0; width: 85vw; max-width: 340px;
+      z-index: 900; transform: translateX(-100%); transition: transform 0.2s ease;
+      padding-top: calc(16px + env(safe-area-inset-top, 0px));
+    }
+    .sidebar.open { transform: translateX(0); }
+    .drawer-backdrop {
+      display: block; position: fixed; inset: 0; z-index: 800;
+      background: rgba(0,0,0,0.6); opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+    }
+    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+
+    .main { padding: 16px; }
+    .main-header { flex-direction: column; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
+    .main-cover { width: 120px; height: 120px; }
+    .main-title { font-size: 22px; }
+    .track-row { padding: 12px 8px; gap: 10px; }
+    .modal-panel { width: 94vw !important; max-width: 94vw !important; max-height: 90dvh; overflow-y: auto; }
+    input, select, textarea { font-size: 16px; } /* stops iOS zoom on focus */
+
+    .bottom-bar {
+      height: auto; display: grid; grid-template-columns: 1fr auto auto auto;
+      grid-auto-rows: auto; align-items: center; gap: 6px 4px;
+      padding: 8px 12px; padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+      overflow: visible;
+    }
+    .bottom-bar .now-playing-info { grid-column: 1; grid-row: 1; width: auto; min-width: 0; }
+    .bottom-bar .skip-btn, .bottom-bar .play-pause-btn { grid-row: 1; }
+    .bottom-bar .skip-btn { width: 40px; height: 40px; font-size: 20px; }
+    .bottom-bar .play-pause-btn { width: 44px; height: 44px; font-size: 16px; }
+    .bottom-bar .transport { grid-column: 1 / -1; grid-row: 2; }
+    .bottom-bar .loop-btn:nth-of-type(1) { grid-column: 1 / 3; grid-row: 3; }
+    .bottom-bar .loop-btn:nth-of-type(2) { grid-column: 3 / 5; grid-row: 3; }
+    .bottom-bar .loop-btn { padding: 8px 10px; }
+    .bottom-bar .bar-divider, .bottom-bar .volume-control { display: none; }
+    input[type="range"] { height: 28px; }
+    .context-menu { max-width: 80vw; }
+    .context-item { padding: 12px 14px; font-size: 15px; }
+  }
+
+
+  .transfer-wrap {
+    background: #101010; border-top: 1px solid #282828; padding: 6px 16px;
+    display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
+  }
+  .transfer-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
+  .transfer-label { flex: 0 1 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .transfer-track { flex: 1; height: 4px; background: #4a4a4a; border-radius: 2px; overflow: hidden; min-width: 40px; }
+  .transfer-fill { height: 100%; background: var(--accent); transition: width 0.15s linear; }
+  .transfer-pct { width: 36px; text-align: right; flex-shrink: 0; }
+  .transfer-detail { flex-shrink: 0; white-space: nowrap; }
+  @media (max-width: 700px) {
+    .transfer-wrap { padding: 6px 12px; }
+    .transfer-label { flex-basis: 45%; }
+    .transfer-detail { display: none; }
+  }
+
   ::-webkit-scrollbar { width: 10px; }
   ::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 6px; }
 </style>
@@ -638,6 +712,7 @@ function App() {
   const [isViewingDownloaded, setIsViewingDownloaded] = useState(false);
   const [downloadStatus, setDownloadStatus] = useState(null);
 
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [playingId, setPlayingId] = useState(null);
   const [playingKey, setPlayingKey] = useState(null);
   const [playingPlaylistId, setPlayingPlaylistId] = useState(null); // set when the current track came from a playlist queue
@@ -654,7 +729,39 @@ function App() {
 
   const audioRef = useRef(null);
 
+  // touch devices do not fire "contextmenu" on long-press (iOS), so emulate it
+  useEffect(() => {
+    let timer = null, startX = 0, startY = 0, fired = false;
+    function cancel() { clearTimeout(timer); timer = null; }
+    function onStart(e) {
+      if (e.touches.length !== 1) return cancel();
+      const t = e.target;
+      if (t.closest && t.closest("input, textarea, select, .context-menu, .modal-panel")) return;
+      startX = e.touches[0].clientX; startY = e.touches[0].clientY; fired = false;
+      timer = setTimeout(() => {
+        fired = true;
+        t.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: startX, clientY: startY }));
+        if (navigator.vibrate) navigator.vibrate(15);
+      }, 500);
+    }
+    function onMove(e) {
+      if (Math.abs(e.touches[0].clientX - startX) > 10 || Math.abs(e.touches[0].clientY - startY) > 10) cancel();
+    }
+    function onEnd(e) { cancel(); if (fired && e.cancelable) e.preventDefault(); } // swallow the click after a long-press
+    document.addEventListener("touchstart", onStart, { passive: true });
+    document.addEventListener("touchmove", onMove, { passive: true });
+    document.addEventListener("touchend", onEnd, { passive: false });
+    document.addEventListener("touchcancel", cancel, { passive: true });
+    return () => {
+      document.removeEventListener("touchstart", onStart);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onEnd);
+      document.removeEventListener("touchcancel", cancel);
+    };
+  }, []);
+
   function openSoundtrack(id) {
+    setSidebarOpen(false);
     setViewingId(id);
     setViewingPlaylistId(null);
     setShowMetaResults(false);
@@ -662,8 +769,28 @@ function App() {
   }
 
   function openPlaylist(id) {
+    setSidebarOpen(false);
     setViewingPlaylistId(id);
     setViewingId(null);
+  }
+
+  function goToNowPlaying() {
+    if (!playingId) return;
+    const item = (playingPlaylistId && library.playlists[playingPlaylistId]) || library.soundtracks[playingId];
+    if (playingPlaylistId && library.playlists[playingPlaylistId]) openPlaylist(playingPlaylistId);
+    else openSoundtrack(playingId);
+    // expand every ancestor folder so the item is visible in the sidebar
+    const open = {};
+    let pid = item && item.parentId;
+    while (pid && library.folders[pid] && !open[pid]) {
+      open[pid] = true;
+      pid = library.folders[pid].parentId;
+    }
+    setExpanded((prev) => ({ ...prev, ...open }));
+    setTimeout(() => {
+      const el = document.querySelector(".track-row.playing");
+      if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 50);
   }
 
   function streamUrl(key) {
@@ -740,8 +867,27 @@ function App() {
     const keys = offlineKeys(soundtrack);
     for (let i = 0; i < keys.length; i++) {
       const res = await fetch(streamUrl(keys[i]));
-      await cache.put(keys[i], res.clone());
-      if (onProgress) onProgress(i + 1, keys.length);
+      if (!res.ok) throw new Error("Download failed (" + res.status + ")");
+      const type = res.headers.get("Content-Type") || "";
+      const total = parseInt(res.headers.get("Content-Length") || "0", 10);
+      let blob;
+      if (res.body && res.body.getReader) {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let loaded = 0;
+        if (onProgress) onProgress({ index: i + 1, count: keys.length, name: keys[i], loaded: 0, total });
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.length;
+          if (onProgress) onProgress({ index: i + 1, count: keys.length, name: keys[i], loaded, total });
+        }
+        blob = new Blob(chunks, { type });
+      } else {
+        blob = await res.blob();
+      }
+      await cache.put(keys[i], new Response(blob, { status: 200, headers: { "Content-Type": type } }));
     }
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
   }
@@ -763,12 +909,80 @@ function App() {
 
   // ---- uploads ----
 
-  async function uploadFile(id, file) {
-    await authedFetch("/api/upload?id=" + encodeURIComponent(id), {
-      method: "POST",
-      headers: { "X-Filename": file.name, "Content-Type": file.type || "application/octet-stream" },
-      body: file,
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState(null);
+
+  function fileLabel(key) {
+    return String(key).split("/").pop();
+  }
+
+  function fmtBytes(n) {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB"];
+    const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+    return (n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + " " + u[i];
+  }
+
+  // overall percent for a progress object; downloads only know per-file size, uploads know the batch size
+  function overallPct(p) {
+    if (p.batch) return p.total ? Math.min(100, (p.loaded / p.total) * 100) : 0;
+    const frac = p.total ? Math.min(1, p.loaded / p.total) : 0;
+    return Math.min(100, ((p.index - 1 + frac) / p.count) * 100);
+  }
+
+  // single file upload via XHR so we get byte-level progress (fetch can't report upload progress)
+  function uploadFile(id, file, onBytes) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", WORKER_URL + "/api/upload?id=" + encodeURIComponent(id));
+      xhr.setRequestHeader("X-Auth-Token", token);
+      xhr.setRequestHeader("X-Filename", file.name);
+      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+      if (onBytes) xhr.upload.onprogress = (e) => onBytes(e.loaded);
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) return resolve();
+        if (xhr.status === 401 || xhr.status === 403) {
+          sessionStorage.removeItem("auth_token");
+          setError("Auth failed. Refresh and re-enter password.");
+        }
+        reject(new Error("upload failed (" + xhr.status + ")"));
+      };
+      xhr.onerror = () => reject(new Error("network error"));
+      xhr.send(file);
     });
+  }
+
+  // upload several files with one combined progress bar
+  async function uploadFiles(id, files) {
+    const list = Array.from(files);
+    const total = list.reduce((a, f) => a + f.size, 0) || 1;
+    let base = 0;
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const f = list[i];
+        const info = { batch: true, index: i + 1, count: list.length, name: f.name, total, label: "Uploading" };
+        setUploadProgress({ ...info, loaded: base });
+        await uploadFile(id, f, (l) => setUploadProgress({ ...info, loaded: base + l }));
+        base += f.size;
+      }
+    } finally {
+      setUploadProgress(null);
+    }
+  }
+
+  function renderTransfer(kind, p) {
+    const pct = Math.round(overallPct(p));
+    const detail = p.batch
+      ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total)
+      : (p.total ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total) : fmtBytes(p.loaded));
+    return (
+      <div className="transfer-row" key={kind}>
+        <div className="transfer-label">{kind} {p.index}/{p.count}: {p.name}</div>
+        <div className="transfer-track"><div className="transfer-fill" style={{ width: pct + "%" }}></div></div>
+        <div className="transfer-pct">{pct}%</div>
+        <div className="transfer-detail">{detail}</div>
+      </div>
+    );
   }
 
   const [showAddForm, setShowAddForm] = useState(false);
@@ -833,7 +1047,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: newName, parentId: newParentId || null }),
       });
-      for (const file of newFiles) await uploadFile(id, file);
+      await uploadFiles(id, newFiles);
 
       if (selectedOnline) {
         if (selectedOnline.coverUrl) {
@@ -869,7 +1083,7 @@ function App() {
     if (!viewingId || !fileList || fileList.length === 0) return;
     setUploading(true);
     try {
-      for (const file of fileList) await uploadFile(viewingId, file);
+      await uploadFiles(viewingId, fileList);
       loadLibrary();
     } catch (e) {
       alert("Upload failed: " + e.message);
@@ -1550,10 +1764,21 @@ function App() {
 
   async function handleDownload() {
     if (!viewingSoundtrackForEffect) return;
+    const st = viewingSoundtrackForEffect;
     setDownloadStatus("Starting...");
-    await downloadSoundtrack(viewingSoundtrackForEffect, (done, total) => setDownloadStatus(`${done} / ${total}`));
-    setDownloadStatus(null);
-    setIsViewingDownloaded(true);
+    setDownloadProgress({ index: 0, count: offlineKeys(st).length, name: st.name, loaded: 0, total: 0, label: st.name });
+    try {
+      await downloadSoundtrack(st, (p) => {
+        setDownloadProgress({ ...p, name: fileLabel(p.name), label: st.name });
+        setDownloadStatus(Math.round(overallPct(p)) + "%");
+      });
+      setIsViewingDownloaded(true);
+    } catch (e) {
+      alert("Download failed: " + e.message);
+    } finally {
+      setDownloadStatus(null);
+      setDownloadProgress(null);
+    }
   }
 
   async function handleRemoveDownload() {
@@ -1590,10 +1815,17 @@ function App() {
 
   return (
     <div className="app">
+      <div className="mobile-topbar">
+        <button className="mobile-menu-btn" onClick={() => setSidebarOpen(true)}>Library</button>
+        <div className="mobile-topbar-title">
+          {viewingPlaylist ? viewingPlaylist.name : viewingSoundtrack ? viewingSoundtrack.name : "My Music"}
+        </div>
+      </div>
+      <div className={"drawer-backdrop" + (sidebarOpen ? " open" : "")} onClick={() => setSidebarOpen(false)}></div>
       <div className="app-body">
 
         <div
-          className="sidebar"
+          className={"sidebar" + (sidebarOpen ? " open" : "")}
           onContextMenu={(e) => openContextMenu(e, { type: "empty" })}
           onDragOver={handleDragOver}
           onDrop={() => {
@@ -1893,11 +2125,18 @@ function App() {
         </div>
       </div>
 
+      {(uploadProgress || downloadProgress) && (
+        <div className="transfer-wrap">
+          {uploadProgress && renderTransfer("Uploading", uploadProgress)}
+          {downloadProgress && renderTransfer("Downloading", downloadProgress)}
+        </div>
+      )}
+
       <div className="bottom-bar">
         <div className="now-playing-info">
           {hasNowPlaying ? (
             <React.Fragment>
-              {playingSoundtrack.cover && <img className="now-playing-cover" src={streamUrl(playingSoundtrack.cover)} />}
+              {playingSoundtrack.cover && <img className="now-playing-cover" style={{cursor: "pointer"}} title="Go to now playing" onClick={goToNowPlaying} src={streamUrl(playingSoundtrack.cover)} />}
               <div style={{minWidth: 0}}>
                 <Marquee text={playingTrack ? stripExt(playingTrack.name) : ""} className="now-playing-track" />
                 <Marquee text={playingSoundtrack.name} className="now-playing-folder" />
