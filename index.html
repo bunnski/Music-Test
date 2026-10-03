@@ -293,6 +293,11 @@
     white-space: nowrap;
   }
 
+  .folder-flag {
+    font-size: 10px; color: var(--text-dim); border: 1px solid #444; border-radius: 8px;
+    padding: 0 6px; margin-left: auto; flex-shrink: 0; white-space: nowrap;
+  }
+
   .folder-playing-dot {
     width: 8px;
     height: 8px;
@@ -1371,6 +1376,25 @@ function App() {
     updateOrder("_pinned", newPinned);
   }
 
+  // ids (folders / playlists) excluded from the random "what plays next" pick; stored in the order map so no worker change is needed
+  const excludedIds = library.order["_excludeRandom"] || [];
+
+  function toggleExcluded(id) {
+    const next = excludedIds.includes(id) ? excludedIds.filter((x) => x !== id) : [...excludedIds, id];
+    updateOrder("_excludeRandom", next);
+    setContextMenu(null);
+  }
+
+  function movePinned(id, dir) {
+    const pinned = [...(library.order["_pinned"] || [])];
+    const i = pinned.indexOf(id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= pinned.length) return;
+    [pinned[i], pinned[j]] = [pinned[j], pinned[i]];
+    updateOrder("_pinned", pinned);
+    setContextMenu(null);
+  }
+
   async function updateOrder(parentPath, newOrder) {
     setLibrary((prev) => ({ ...prev, order: { ...prev.order, [parentPath]: newOrder } }));
     await authedFetch("/api/order", {
@@ -1398,6 +1422,7 @@ function App() {
     .map((id) => {
       if (library.soundtracks[id]) return { type: "soundtrack", ...library.soundtracks[id] };
       if (library.playlists[id]) return { type: "playlist", ...library.playlists[id] };
+      if (library.folders[id]) return { type: "folder", ...library.folders[id] };
       return null;
     })
     .filter(Boolean);
@@ -1514,6 +1539,7 @@ function App() {
               <span className="category-arrow">{isOpen ? "▼" : "▶"}</span>
               <div className="category-icon">📁</div>
               <span className="folder-name">{item.name}</span>
+              {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
             </div>
             {isOpen && renderItems(item.id, indentLevel + 1)}
           </React.Fragment>
@@ -1540,6 +1566,7 @@ function App() {
               <div className="category-icon">🎶</div>
             )}
             <span className="folder-name">{item.name}</span>
+            {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
           </div>
         );
       }
@@ -1560,6 +1587,7 @@ function App() {
           <span className="drag-handle">⠿</span>
           <img className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
           <span className="folder-name">{item.name}</span>
+          {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
           {item.id === playingId && <div className="folder-playing-dot"></div>}
         </div>
       );
@@ -1584,13 +1612,33 @@ function App() {
     setPlayingPlaylistId(playlistId || null);
   }
 
-  // picks a random soundtrack sharing the same parent folder, excluding one id, that actually has tracks
-  function pickRandomSiblingSoundtrack(parentId, excludeId) {
-    const candidates = allSoundtracks.filter(
-      (s) => (s.parentId || null) === (parentId || null) && s.id !== excludeId && s.tracks.length > 0
-    );
-    if (candidates.length === 0) return null;
-    return candidates[Math.floor(Math.random() * candidates.length)];
+  // when something finishes, pick a random soundtrack or playlist from the same parent folder (including inside its
+  // subfolders), skipping anything excluded: excluded folders/playlists, and everything inside excluded folders.
+  function playRandomNext(parentId, skipSoundtrackId, skipPlaylistId) {
+    const pool = [];
+    const same = (a) => (a || null) === (parentId || null);
+    function walk(pid) {
+      allSoundtracks.forEach((s) => {
+        if ((s.parentId || null) === (pid || null) && s.id !== skipSoundtrackId && !excludedIds.includes(s.id) && s.tracks.length > 0) pool.push({ type: "soundtrack", item: s });
+      });
+      Object.values(library.playlists).forEach((pl) => {
+        if ((pl.parentId || null) !== (pid || null) || pl.id === skipPlaylistId || excludedIds.includes(pl.id)) return;
+        const first = pl.tracks.find((r) => library.soundtracks[r.soundtrackId] && library.soundtracks[r.soundtrackId].tracks.some((t) => t.key === r.key));
+        if (first) pool.push({ type: "playlist", item: pl, first });
+      });
+      Object.values(library.folders).forEach((f) => {
+        if ((f.parentId || null) === (pid || null) && !excludedIds.includes(f.id)) walk(f.id);
+      });
+    }
+    walk(parentId);
+    if (pool.length === 0) return;
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    if (pick.type === "playlist") {
+      playTrackAt(pick.first.soundtrackId, pick.first.key, pick.item.id);
+    } else {
+      const st = pick.item;
+      playTrackAt(st.id, st.tracks[Math.floor(Math.random() * st.tracks.length)].key, null);
+    }
   }
 
   useEffect(() => {
@@ -1681,9 +1729,8 @@ function App() {
           playTrackAt(next.soundtrackId, next.key, playingPlaylistId);
           return;
         }
-        // playlist finished - continue with a random soundtrack from the same folder
-        const sibling = pickRandomSiblingSoundtrack(playlist.parentId, null);
-        if (sibling) playTrackAt(sibling.id, sibling.tracks[Math.floor(Math.random() * sibling.tracks.length)].key, null);
+        // playlist finished - continue with a random pick from the same folder
+        playRandomNext(playlist.parentId, null, playlist.id);
       }
       return;
     }
@@ -1707,9 +1754,8 @@ function App() {
       return;
     }
 
-    // reached the end of this soundtrack - continue with a random soundtrack from the same folder, if any
-    const sibling = pickRandomSiblingSoundtrack(soundtrack.parentId, soundtrack.id);
-    if (sibling) playTrackAt(sibling.id, sibling.tracks[Math.floor(Math.random() * sibling.tracks.length)].key);
+    // reached the end of this soundtrack - continue with a random pick from the same folder
+    playRandomNext(soundtrack.parentId, soundtrack.id, null);
   }
 
   // ---- track reordering ----
@@ -1833,7 +1879,7 @@ function App() {
             // so this only triggers for drops on truly empty sidebar space - moves the dragged item to the top level
             const drag = dragRef.current;
             dragRef.current = null;
-            if (drag) moveItem(drag.meta.type, drag.meta.id, null);
+            if (drag && drag.parentPath !== "_pinned") moveItem(drag.meta.type, drag.meta.id, null);
           }}
         >
           <div className="sidebar-header">
@@ -1942,24 +1988,51 @@ function App() {
               {pinnedItems.length > 0 && (
                 <React.Fragment>
                   <div className="section-label">Pinned</div>
-                  {pinnedItems.map((p) => (
-                    <div
-                      key={"pin-" + p.id}
-                      className={"folder-item" + ((p.type === "soundtrack" ? p.id === viewingId : p.id === viewingPlaylistId) ? " active" : "")}
-                      onClick={() => (p.type === "soundtrack" ? openSoundtrack(p.id) : openPlaylist(p.id))}
-                      onContextMenu={(e) => openContextMenu(e, { type: p.type, id: p.id })}
-                    >
-                      {p.type === "soundtrack" ? (
-                        <img className="folder-thumb" src={p.cover ? streamUrl(p.cover) : ""} />
-                      ) : p.cover ? (
-                        <img className="folder-thumb" src={streamUrl(p.cover)} />
-                      ) : (
-                        <div className="category-icon">🎶</div>
-                      )}
-                      <span className="folder-name">{p.name}</span>
-                      {p.type === "soundtrack" && p.id === playingId && <div className="folder-playing-dot"></div>}
-                    </div>
-                  ))}
+                  {pinnedItems.map((p, pi) => {
+                    const pmeta = { type: p.type, id: p.id };
+                    const dragProps = {
+                      draggable: true,
+                      onDragStart: () => handleDragStart("_pinned", pi, pmeta),
+                      onDragOver: handleDragOver,
+                      onDrop: () => handleDropReorder("_pinned", pinnedItems, pi),
+                      onContextMenu: (e) => openContextMenu(e, { type: p.type, id: p.id, pinned: true }),
+                    };
+                    if (p.type === "folder") {
+                      const pinOpen = !!expanded["pin:" + p.id];
+                      return (
+                        <React.Fragment key={"pin-" + p.id}>
+                          <div className="folder-item" {...dragProps} onClick={() => setExpanded((prev) => ({ ...prev, ["pin:" + p.id]: !prev["pin:" + p.id] }))}>
+                            <span className="drag-handle">⠿</span>
+                            <span className="category-arrow">{pinOpen ? "▼" : "▶"}</span>
+                            <div className="category-icon">📁</div>
+                            <span className="folder-name">{p.name}</span>
+                            {excludedIds.includes(p.id) && <span className="folder-flag">no random</span>}
+                          </div>
+                          {pinOpen && renderItems(p.id, 1)}
+                        </React.Fragment>
+                      );
+                    }
+                    return (
+                      <div
+                        key={"pin-" + p.id}
+                        className={"folder-item" + ((p.type === "soundtrack" ? p.id === viewingId : p.id === viewingPlaylistId) ? " active" : "")}
+                        {...dragProps}
+                        onClick={() => (p.type === "soundtrack" ? openSoundtrack(p.id) : openPlaylist(p.id))}
+                      >
+                        <span className="drag-handle">⠿</span>
+                        {p.type === "soundtrack" ? (
+                          <img className="folder-thumb" src={p.cover ? streamUrl(p.cover) : ""} />
+                        ) : p.cover ? (
+                          <img className="folder-thumb" src={streamUrl(p.cover)} />
+                        ) : (
+                          <div className="category-icon">🎶</div>
+                        )}
+                        <span className="folder-name">{p.name}</span>
+                        {excludedIds.includes(p.id) && <span className="folder-flag">no random</span>}
+                        {p.type === "soundtrack" && p.id === playingId && <div className="folder-playing-dot"></div>}
+                      </div>
+                    );
+                  })}
                 </React.Fragment>
               )}
 
@@ -2301,6 +2374,12 @@ function App() {
             </React.Fragment>
           ) : (
             <React.Fragment>
+              {["folder", "soundtrack", "playlist"].includes(contextMenu.target.type) && pinnedIds.includes(contextMenu.target.id) && (
+                <React.Fragment>
+                  <div className="context-item" onClick={() => movePinned(contextMenu.target.id, -1)}>Move up in pinned</div>
+                  <div className="context-item" onClick={() => movePinned(contextMenu.target.id, 1)}>Move down in pinned</div>
+                </React.Fragment>
+              )}
               {contextMenu.target.type === "empty" && (
                 <React.Fragment>
                   <div className="context-item" onClick={() => handleCreateFolder(null)}>New folder</div>
@@ -2309,6 +2388,12 @@ function App() {
               )}
               {contextMenu.target.type === "folder" && (
                 <React.Fragment>
+                  <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
+                    {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
+                  </div>
+                  <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
+                    Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
+                  </div>
                   <div className="context-item" onClick={() => { setShowAddForm(true); setNewParentId(contextMenu.target.id); }}>
                     Add soundtrack here
                   </div>
@@ -2326,6 +2411,9 @@ function App() {
                   <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
                     {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
                   </div>
+                  <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
+                    Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
+                  </div>
                   <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
                   {library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].parentId && (
                     <div className="context-item" onClick={() => moveItem("soundtrack", contextMenu.target.id, null)}>Move to top level</div>
@@ -2337,6 +2425,9 @@ function App() {
                 <React.Fragment>
                   <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
                     {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
+                  </div>
+                  <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
+                    Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
                   </div>
                   <div className="context-item" onClick={() => handleRenamePlaylist(contextMenu.target.id)}>Rename</div>
                   {library.playlists[contextMenu.target.id] && library.playlists[contextMenu.target.id].parentId && (
