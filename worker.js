@@ -323,6 +323,60 @@ export default {
       return json({ success: true });
     }
 
+    // ---- podcasts ----
+
+    // GET /api/podcast-feed?url=<rss url> -> passes the feed XML through (browsers can't fetch feeds directly because of CORS).
+    // Deliberately light: one fetch, edge-cached for 15 minutes, no parsing (the browser parses it). Audio never touches the Worker.
+    if (path === "/api/podcast-feed" && request.method === "GET") {
+      let u;
+      try { u = new URL(url.searchParams.get("url")); } catch (e) {
+        return new Response("Bad url", { status: 400, headers: corsHeaders });
+      }
+      const host = u.hostname.toLowerCase();
+      const blocked =
+        !/^https?:$/.test(u.protocol) || host === "localhost" || host.endsWith(".local") || host.endsWith(".internal") ||
+        host.includes(":") || /^(0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
+      if (blocked) return new Response("Url not allowed", { status: 400, headers: corsHeaders });
+
+      let res;
+      try {
+        res = await fetch(u.toString(), {
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; MyMusic/1.0)", "Accept": "application/rss+xml, application/xml, text/xml, */*" },
+          cf: { cacheTtl: 900, cacheEverything: true },
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch (e) {
+        return new Response("Could not reach feed", { status: 502, headers: corsHeaders });
+      }
+      if (!res.ok) return new Response("Feed returned " + res.status, { status: 502, headers: corsHeaders });
+      if (parseInt(res.headers.get("Content-Length") || "0", 10) > 8000000) {
+        return new Response("Feed too large", { status: 413, headers: corsHeaders });
+      }
+      const text = await res.text();
+      if (text.length > 8000000) return new Response("Feed too large", { status: 413, headers: corsHeaders });
+      return new Response(text, { headers: { ...corsHeaders, "Content-Type": "text/xml; charset=utf-8" } });
+    }
+
+    // POST /api/add-podcast { name, feedUrl, cover, artist, description, parentId }
+    // Stores a podcast as a soundtrack with a feedUrl and NO tracks - episodes are read from the feed by the browser each time.
+    if (path === "/api/add-podcast" && request.method === "POST") {
+      const { name, feedUrl, cover, artist, description, parentId } = await request.json();
+      if (!name || !/^https?:\/\//i.test(feedUrl || "")) {
+        return new Response("Missing name or feedUrl", { status: 400, headers: corsHeaders });
+      }
+      const library = await getLibrary(env);
+      const existing = Object.values(library.soundtracks).find((s) => s.feedUrl === feedUrl);
+      if (existing) return json({ success: true, id: existing.id, existing: true });
+      const id = generateId(name);
+      library.soundtracks[id] = {
+        id, name, parentId: parentId || null,
+        cover: /^https?:\/\//i.test(cover || "") ? cover : null,
+        tracks: [], feedUrl, artist: artist || "", description: (description || "").slice(0, 1000),
+      };
+      await saveLibrary(env, library);
+      return json({ success: true, id });
+    }
+
     // ---- tracks ----
 
     // POST /api/rename-track { id, key, name }

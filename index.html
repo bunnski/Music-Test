@@ -293,6 +293,11 @@
     white-space: nowrap;
   }
 
+  .ep-progress { height: 3px; width: 120px; max-width: 60%; background: #3a3a3a; border-radius: 2px; margin-top: 5px; overflow: hidden; }
+  .ep-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s linear; }
+  .ep-meta { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+  .ep-done { opacity: 0.55; }
+
   .folder-flag {
     font-size: 10px; color: var(--text-dim); border: 1px solid #444; border-radius: 8px;
     padding: 0 6px; margin-left: auto; flex-shrink: 0; white-space: nowrap;
@@ -676,7 +681,64 @@ const { useState, useEffect, useRef } = React;
 const WORKER_URL = "https://my-music-worker.noahnator-workers.workers.dev";
 
 function stripExt(filename) {
-  return filename.replace(/\.[^/.]+$/, "");
+  return filename.replace(/\.(mp3|m4a|m4b|aac|wav|flac|ogg|oga|opus|wma|aif|aiff|mp4|webm)$/i, "");
+}
+
+// per-episode listening progress, kept in this browser's localStorage
+function readProg(key) {
+  try {
+    return {
+      pos: parseInt(localStorage.getItem("pos:" + key) || "0", 10),
+      dur: parseFloat(localStorage.getItem("dur:" + key) || "0"),
+      done: localStorage.getItem("done:" + key) === "1",
+    };
+  } catch (e) { return { pos: 0, dur: 0, done: false }; }
+}
+function fmtLeft(sec) {
+  const m = Math.max(1, Math.ceil(sec / 60));
+  return m >= 60 ? Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m left" : m + "m left";
+}
+
+const isExternal = (key) => /^https?:\/\//i.test(key || "");
+
+// parses podcast RSS XML into { title, description, artist, cover, tracks } (tracks use the episode audio url as their key)
+function parsePodcastFeed(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const channel = doc.querySelector("channel");
+  if (doc.querySelector("parsererror") || !channel) throw new Error("That does not look like a podcast feed");
+  const kids = (el) => Array.from(el.children);
+  const child = (el, name) => kids(el).find((c) => c.localName === name);
+  const txt = (el, name) => { const c = child(el, name); return c ? c.textContent.trim() : ""; };
+  const https = (u) => (u || "").replace(/^http:\/\//i, "https://");
+
+  let cover = "";
+  const imgs = kids(channel).filter((c) => c.localName === "image");
+  for (const im of imgs) {
+    const href = im.getAttribute("href");
+    if (href) { cover = href; break; }
+    const u = child(im, "url");
+    if (u && !cover) cover = u.textContent.trim();
+  }
+
+  const seen = new Set();
+  let tracks = kids(channel).filter((c) => c.localName === "item").map((item) => {
+    const enc = child(item, "enclosure");
+    const url = enc ? https(enc.getAttribute("url")) : "";
+    if (!url || seen.has(url)) return null;
+    seen.add(url);
+    const date = Date.parse(txt(item, "pubDate"));
+    return { key: url, name: txt(item, "title") || "Episode", date: isNaN(date) ? 0 : date };
+  }).filter(Boolean);
+  if (tracks.every((t) => t.date)) tracks.sort((a, b) => b.date - a.date); // newest first
+  tracks = tracks.slice(0, 300);
+
+  return {
+    title: txt(channel, "title"),
+    description: txt(channel, "description").replace(/<[^>]*>/g, "").slice(0, 1000),
+    artist: txt(channel, "author"),
+    cover: https(cover),
+    tracks,
+  };
 }
 
 function applyOrder(items, orderKeys, getKey) {
@@ -765,6 +827,134 @@ function App() {
     };
   }, []);
 
+  // ---- podcasts (episodes come from the RSS feed in the browser; the Worker only passes the XML through) ----
+  const podcastCacheRef = useRef({}); // id -> { tracks, at }
+  const [podcastStatus, setPodcastStatus] = useState({}); // id -> "loading" | error text
+  const [showPodcastModal, setShowPodcastModal] = useState(false);
+  const [podcastParent, setPodcastParent] = useState(null);
+  const [podcastInput, setPodcastInput] = useState("");
+  const [podcastResults, setPodcastResults] = useState([]);
+  const [podcastBusy, setPodcastBusy] = useState(false);
+  const [podcastError, setPodcastError] = useState("");
+  const [progressMap, setProgressMap] = useState({}); // episode key -> { pos, dur, done }
+
+  function refreshProg(key) {
+    setProgressMap((m) => ({ ...m, [key]: readProg(key) }));
+  }
+
+  function markPlayed(key) {
+    try { localStorage.setItem("done:" + key, "1"); localStorage.removeItem("pos:" + key); } catch (e) {}
+    refreshProg(key);
+    setContextMenu(null);
+  }
+
+  function resetProg(key) {
+    try { localStorage.removeItem("pos:" + key); localStorage.removeItem("done:" + key); } catch (e) {}
+    refreshProg(key);
+    setContextMenu(null);
+  }
+
+  // load saved progress for the episodes of the podcast being viewed
+  useEffect(() => {
+    const st = viewingId && library.soundtracks[viewingId];
+    if (!st || !st.feedUrl) return;
+    const m = {};
+    st.tracks.forEach((t) => { m[t.key] = readProg(t.key); });
+    setProgressMap((prev) => ({ ...prev, ...m }));
+  }, [viewingId, library.soundtracks[viewingId] ? library.soundtracks[viewingId].tracks.length : 0]);
+
+  async function fetchFeedXml(feedUrl) {
+    const res = await fetch(WORKER_URL + "/api/podcast-feed?url=" + encodeURIComponent(feedUrl), { headers: { "X-Auth-Token": token } });
+    if (!res.ok) throw new Error(res.status === 401 ? "Not authorised" : (await res.text()) || "Could not load feed");
+    return res.text();
+  }
+
+  async function fetchPodcastEpisodes(id) {
+    const st = library.soundtracks[id];
+    if (!st || !st.feedUrl) return;
+    const c = podcastCacheRef.current[id];
+    if (c && (c.loading || Date.now() - c.at < 600000)) return; // fresh enough (10 min) or already loading
+    podcastCacheRef.current[id] = { tracks: c ? c.tracks : [], at: c ? c.at : 0, loading: true };
+    setPodcastStatus((p) => ({ ...p, [id]: "loading" }));
+    try {
+      const feed = parsePodcastFeed(await fetchFeedXml(st.feedUrl));
+      podcastCacheRef.current[id] = { tracks: feed.tracks, at: Date.now() };
+      setLibrary((prev) => prev.soundtracks[id] ? { ...prev, soundtracks: { ...prev.soundtracks, [id]: { ...prev.soundtracks[id], tracks: feed.tracks } } } : prev);
+      setPodcastStatus((p) => ({ ...p, [id]: null }));
+    } catch (e) {
+      podcastCacheRef.current[id] = { tracks: c ? c.tracks : [], at: Date.now() }; // avoid retry loops
+      setPodcastStatus((p) => ({ ...p, [id]: "Could not load episodes: " + e.message }));
+    }
+  }
+
+  // whenever the library reloads from the server (podcasts are saved without episodes), put cached episodes back
+  useEffect(() => {
+    const next = {};
+    Object.values(library.soundtracks).forEach((st) => {
+      const c = podcastCacheRef.current[st.id];
+      if (st.feedUrl && st.tracks.length === 0 && c && c.tracks.length > 0) next[st.id] = { ...st, tracks: c.tracks };
+    });
+    if (Object.keys(next).length) setLibrary((prev) => ({ ...prev, soundtracks: { ...prev.soundtracks, ...next } }));
+  }, [library]);
+
+  // load (or refresh) episodes when opening a podcast
+  useEffect(() => {
+    if (viewingId) fetchPodcastEpisodes(viewingId);
+  }, [viewingId, library.soundtracks[viewingId] ? library.soundtracks[viewingId].feedUrl : null]);
+
+  function openPodcastModal(parentId) {
+    setPodcastParent(parentId || null);
+    setPodcastInput("");
+    setPodcastResults([]);
+    setPodcastError("");
+    setShowPodcastModal(true);
+    setContextMenu(null);
+  }
+
+  async function searchPodcasts() {
+    const q = podcastInput.trim();
+    if (!q) return;
+    if (isExternal(q)) return addPodcast(q);
+    setPodcastBusy(true);
+    setPodcastError("");
+    try {
+      const res = await fetch("https://itunes.apple.com/search?media=podcast&entity=podcast&limit=8&term=" + encodeURIComponent(q));
+      const data = await res.json();
+      const results = (data.results || []).filter((r) => r.feedUrl);
+      setPodcastResults(results);
+      if (results.length === 0) setPodcastError("No podcasts found. Try pasting the RSS link instead.");
+    } catch (e) {
+      setPodcastError("Search failed. Try pasting the RSS link instead.");
+    }
+    setPodcastBusy(false);
+  }
+
+  async function addPodcast(feedUrl) {
+    setPodcastBusy(true);
+    setPodcastError("");
+    try {
+      const feed = parsePodcastFeed(await fetchFeedXml(feedUrl));
+      const res = await fetch(WORKER_URL + "/api/add-podcast", {
+        method: "POST",
+        headers: { "X-Auth-Token": token, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: feed.title || "Podcast", feedUrl, cover: feed.cover, artist: feed.artist,
+          description: feed.description, parentId: podcastParent,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      podcastCacheRef.current[data.id] = { tracks: feed.tracks, at: Date.now() };
+      await loadLibrary();
+      setShowPodcastModal(false);
+      if (podcastParent) setExpanded((prev) => ({ ...prev, [podcastParent]: true }));
+      openSoundtrack(data.id);
+    } catch (e) {
+      setPodcastError("Could not add podcast: " + e.message);
+    }
+    setPodcastBusy(false);
+  }
+
   function openSoundtrack(id) {
     setSidebarOpen(false);
     setViewingId(id);
@@ -799,6 +989,7 @@ function App() {
   }
 
   function streamUrl(key) {
+    if (isExternal(key)) return key; // podcast audio and covers play straight from the publisher, not through the Worker
     return `${WORKER_URL}/api/stream/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
   }
 
@@ -903,6 +1094,7 @@ function App() {
   }
 
   async function getPlayableUrl(key) {
+    if (isExternal(key)) return key;
     const cache = await caches.open(OFFLINE_CACHE);
     const cached = await cache.match(key);
     if (cached) {
@@ -1587,7 +1779,7 @@ function App() {
           <span className="drag-handle">⠿</span>
           <img className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
           <span className="folder-name">{item.name}</span>
-          {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
+          {excludedIds.includes(item.id) && !item.feedUrl && <span className="folder-flag">no random</span>}
           {item.id === playingId && <div className="folder-playing-dot"></div>}
         </div>
       );
@@ -1619,7 +1811,7 @@ function App() {
     const same = (a) => (a || null) === (parentId || null);
     function walk(pid) {
       allSoundtracks.forEach((s) => {
-        if ((s.parentId || null) === (pid || null) && s.id !== skipSoundtrackId && !excludedIds.includes(s.id) && s.tracks.length > 0) pool.push({ type: "soundtrack", item: s });
+        if ((s.parentId || null) === (pid || null) && s.id !== skipSoundtrackId && !excludedIds.includes(s.id) && !s.feedUrl && s.tracks.length > 0) pool.push({ type: "soundtrack", item: s });
       });
       Object.values(library.playlists).forEach((pl) => {
         if ((pl.parentId || null) !== (pid || null) || pl.id === skipPlaylistId || excludedIds.includes(pl.id)) return;
@@ -1718,6 +1910,10 @@ function App() {
 
   function handleEnded() {
     if (loopTrack) return;
+    if (isExternal(playingKey)) {
+      try { localStorage.removeItem("pos:" + playingKey); localStorage.setItem("done:" + playingKey, "1"); } catch (e) {}
+      refreshProg(playingKey);
+    }
 
     if (playingPlaylistId) {
       const playlist = library.playlists[playingPlaylistId];
@@ -1754,6 +1950,7 @@ function App() {
       return;
     }
 
+    if (soundtrack.feedUrl) return; // podcasts just stop at the last episode
     // reached the end of this soundtrack - continue with a random pick from the same folder
     playRandomNext(soundtrack.parentId, soundtrack.id, null);
   }
@@ -1884,7 +2081,10 @@ function App() {
         >
           <div className="sidebar-header">
             <h1>Library</h1>
-            <button className="add-btn" onClick={() => setShowAddForm(!showAddForm)}>+</button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button className="add-btn" style={{ width: "auto", padding: "0 8px", fontSize: 12 }} onClick={() => openPodcastModal(null)}>Podcast</button>
+              <button className="add-btn" onClick={() => setShowAddForm(!showAddForm)}>+</button>
+            </div>
           </div>
 
           <div className="search-wrap">
@@ -2006,7 +2206,7 @@ function App() {
                             <span className="category-arrow">{pinOpen ? "▼" : "▶"}</span>
                             <div className="category-icon">📁</div>
                             <span className="folder-name">{p.name}</span>
-                            {excludedIds.includes(p.id) && <span className="folder-flag">no random</span>}
+                            {excludedIds.includes(p.id) && !p.feedUrl && <span className="folder-flag">no random</span>}
                           </div>
                           {pinOpen && renderItems(p.id, 1)}
                         </React.Fragment>
@@ -2106,6 +2306,8 @@ function App() {
                   )}
                 </div>
               </div>
+              {!viewingSoundtrack.feedUrl && (
+              <React.Fragment>
               <label className="add-tracks-btn">
                 {uploading ? "Uploading..." : "+ Add tracks"}
                 <input type="file" multiple accept="audio/*,image/*" style={{display: "none"}} disabled={uploading}
@@ -2120,11 +2322,27 @@ function App() {
                 <button className="add-tracks-btn" onClick={handleDownload}>Download for offline</button>
               )}
               {" "}
+              </React.Fragment>
+              )}
+              {viewingSoundtrack.feedUrl && (
+                <React.Fragment>
+                  <button className="add-tracks-btn" disabled={podcastStatus[viewingId] === "loading"}
+                    onClick={() => { delete podcastCacheRef.current[viewingId]; fetchPodcastEpisodes(viewingId); }}>
+                    {podcastStatus[viewingId] === "loading" ? "Loading episodes..." : "Refresh episodes"}
+                  </button>
+                  {" "}
+                </React.Fragment>
+              )}
               <button className="add-tracks-btn" onClick={() => openEditModal("soundtrack", viewingId)}>✏️ Edit</button>
               {" "}
+              {!viewingSoundtrack.feedUrl && (
               <button className="add-tracks-btn" onClick={handleTryGetMeta} disabled={metaSearching}>
                 {metaSearching ? "Searching..." : "🔎 Try Get Meta"}
               </button>
+              )}
+              {viewingSoundtrack.feedUrl && podcastStatus[viewingId] && podcastStatus[viewingId] !== "loading" && (
+                <div className="search-subtitle" style={{ marginTop: 8 }}>{podcastStatus[viewingId]}</div>
+              )}
 
               {showMetaResults && (
                 <div className="modal-backdrop" onClick={() => setShowMetaResults(false)}>
@@ -2176,7 +2394,7 @@ function App() {
                   <div
                     key={track.key}
                     className={"track-row" + (isPlaying ? " playing" : "")}
-                    draggable
+                    draggable={!viewingSoundtrack.feedUrl}
                     onDragStart={() => handleTrackDragStart(i)}
                     onDragOver={(e) => e.preventDefault()}
                     onDrop={() => handleTrackDrop(i, viewingSoundtrack.tracks)}
@@ -2189,7 +2407,24 @@ function App() {
                       src={track.cover ? streamUrl(track.cover) : (viewingSoundtrack.cover ? streamUrl(viewingSoundtrack.cover) : "")}
                     />
                     <span className="track-index">{isPlaying ? "▶" : i + 1}</span>
-                    <span>{stripExt(track.name)}</span>
+                    {viewingSoundtrack.feedUrl ? (() => {
+                      const pr = isPlaying && duration > 0 ? { pos: currentTime, dur: duration, done: false } : (progressMap[track.key] || { pos: 0, dur: 0, done: false });
+                      const frac = pr.done ? 1 : pr.dur > 0 ? Math.min(1, pr.pos / pr.dur) : 0;
+                      const showBar = pr.done || pr.pos > 5;
+                      return (
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div className={pr.done ? "ep-done" : ""}>{stripExt(track.name)}</div>
+                          {showBar && (
+                            <React.Fragment>
+                              <div className="ep-progress"><div className="ep-progress-fill" style={{ width: Math.round(frac * 100) + "%", opacity: pr.done ? 0.35 : 1 }}></div></div>
+                              <div className="ep-meta">{pr.done ? "Played" : pr.dur > 0 ? fmtLeft(pr.dur - pr.pos) : "In progress"}</div>
+                            </React.Fragment>
+                          )}
+                        </div>
+                      );
+                    })() : (
+                      <span>{stripExt(track.name)}</span>
+                    )}
                   </div>
                 );
               })}
@@ -2227,8 +2462,27 @@ function App() {
           onEnded={handleEnded}
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
-          onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
-          onLoadedMetadata={(e) => setDuration(e.target.duration)}
+          onTimeUpdate={(e) => {
+            const t = e.target.currentTime;
+            setCurrentTime(t);
+            if (isExternal(playingKey) && Math.floor(t) % 5 === 0 && t > 5) {
+              try {
+                localStorage.setItem("pos:" + playingKey, String(Math.floor(t)));
+                if (e.target.duration) localStorage.setItem("dur:" + playingKey, String(Math.floor(e.target.duration)));
+                localStorage.removeItem("done:" + playingKey);
+              } catch (err) {}
+              refreshProg(playingKey);
+            }
+          }}
+          onLoadedMetadata={(e) => {
+            setDuration(e.target.duration);
+            if (isExternal(playingKey)) {
+              try {
+                const saved = parseInt(localStorage.getItem("pos:" + playingKey) || "0", 10);
+                if (saved > 5 && saved < e.target.duration - 10) e.target.currentTime = saved;
+              } catch (err) {}
+            }
+          }}
           style={{ display: "none" }}
         ></audio>
 
@@ -2292,6 +2546,44 @@ function App() {
           Loop {loopTrack ? "On" : "Off"}
         </button>
       </div>
+
+      {showPodcastModal && (
+        <div className="modal-backdrop" onClick={() => setShowPodcastModal(false)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Add podcast</h3>
+              <button className="modal-close" onClick={() => setShowPodcastModal(false)}>x</button>
+            </div>
+            <input
+              type="text"
+              className="search-input"
+              style={{ marginBottom: 8 }}
+              placeholder="Podcast name or RSS link"
+              value={podcastInput}
+              autoFocus
+              onChange={(e) => setPodcastInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") searchPodcasts(); }}
+            />
+            <button className="add-tracks-btn" onClick={searchPodcasts} disabled={podcastBusy || !podcastInput.trim()}>
+              {podcastBusy ? "Working..." : isExternal(podcastInput.trim()) ? "Add from link" : "Search"}
+            </button>
+            {podcastError && <div className="search-subtitle" style={{ marginTop: 10 }}>{podcastError}</div>}
+            {podcastResults.length > 0 && (
+              <div className="online-results" style={{ marginTop: 10 }}>
+                {podcastResults.map((r, i) => (
+                  <div key={i} className="online-result" onClick={() => !podcastBusy && addPodcast(r.feedUrl)}>
+                    {r.artworkUrl100 && <img src={r.artworkUrl100} className="online-result-thumb" />}
+                    <div style={{ minWidth: 0 }}>
+                      <div className="online-result-name">{r.collectionName}</div>
+                      <div className="online-result-sub">{r.artistName}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {showEditModal && editTarget && (
         <div className="modal-backdrop" onClick={() => setShowEditModal(false)}>
@@ -2384,6 +2676,7 @@ function App() {
                 <React.Fragment>
                   <div className="context-item" onClick={() => handleCreateFolder(null)}>New folder</div>
                   <div className="context-item" onClick={() => handleCreatePlaylist(null)}>New playlist</div>
+                  <div className="context-item" onClick={() => openPodcastModal(null)}>Add podcast...</div>
                 </React.Fragment>
               )}
               {contextMenu.target.type === "folder" && (
@@ -2394,6 +2687,7 @@ function App() {
                   <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
                     Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
                   </div>
+                  <div className="context-item" onClick={() => openPodcastModal(contextMenu.target.id)}>Add podcast...</div>
                   <div className="context-item" onClick={() => { setShowAddForm(true); setNewParentId(contextMenu.target.id); }}>
                     Add soundtrack here
                   </div>
@@ -2411,9 +2705,11 @@ function App() {
                   <div className="context-item" onClick={() => togglePin(contextMenu.target.id)}>
                     {pinnedIds.includes(contextMenu.target.id) ? "Unpin" : "Pin"}
                   </div>
-                  <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
-                    Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
-                  </div>
+                  {!(library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].feedUrl) && (
+                    <div className="context-item" onClick={() => toggleExcluded(contextMenu.target.id)}>
+                      Random pick: {excludedIds.includes(contextMenu.target.id) ? "Excluded" : "Included"}
+                    </div>
+                  )}
                   <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
                   {library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].parentId && (
                     <div className="context-item" onClick={() => moveItem("soundtrack", contextMenu.target.id, null)}>Move to top level</div>
@@ -2445,6 +2741,12 @@ function App() {
                     Remove from playlist
                   </div>
                 ) : (
+                  isExternal(contextMenu.target.key) ? (
+                    <React.Fragment>
+                      <div className="context-item" onClick={() => markPlayed(contextMenu.target.key)}>Mark as played</div>
+                      <div className="context-item" onClick={() => resetProg(contextMenu.target.key)}>Reset progress</div>
+                    </React.Fragment>
+                  ) : (
                   <React.Fragment>
                     <div className="context-item" onClick={() => handleRenameTrack(contextMenu.target.id, contextMenu.target.key)}>Rename</div>
                     <div className="context-item" onClick={() => setPlaylistPickerFor({ id: contextMenu.target.id, key: contextMenu.target.key })}>
@@ -2452,6 +2754,7 @@ function App() {
                     </div>
                     <div className="context-item danger" onClick={() => handleDeleteTrack(contextMenu.target.id, contextMenu.target.key)}>Delete</div>
                   </React.Fragment>
+                  )
                 )
               )}
             </React.Fragment>
