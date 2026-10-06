@@ -297,6 +297,12 @@
   .ep-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s linear; }
   .ep-meta { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
   .ep-done { opacity: 0.55; }
+  .sync-badge {
+    position: fixed; top: 12px; right: 16px; z-index: 50;
+    background: #181818; border: 1px solid #333; border-radius: 12px;
+    padding: 3px 10px; font-size: 12px; color: var(--text-dim); pointer-events: none;
+  }
+  .sync-badge.offline { color: #e0a030; border-color: #e0a030; }
 
   .folder-flag {
     font-size: 10px; color: var(--text-dim); border: 1px solid #444; border-radius: 8px;
@@ -602,6 +608,7 @@
       background: transparent; border: 1px solid #444; color: var(--text);
       border-radius: 16px; padding: 6px 14px; font-size: 13px; font-family: inherit;
     }
+    .sync-badge { top: calc(54px + env(safe-area-inset-top, 0px)); right: 12px; }
     .mobile-topbar-title { font-size: 14px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .sidebar {
@@ -928,6 +935,18 @@ function App() {
   const lastSavedAtRef = useRef(0);
   const lastFlushRef = useRef(0);
   const [syncStatus, setSyncStatus] = useState("");
+  const lastOkRef = useRef(0);
+
+  function markSynced() {
+    lastOkRef.current = Date.now();
+    setSyncStatus("Synced " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+  }
+
+  // one failed request is not "offline": only say so if the browser reports it, or nothing has worked for 45 seconds
+  function markFailed(err) {
+    console.warn("progress sync failed:", err);
+    if (navigator.onLine === false || Date.now() - lastOkRef.current > 45000) setSyncStatus("Offline");
+  }
 
   function persistPending() {
     try { localStorage.setItem("prog:pending", JSON.stringify(Array.from(pendingProgRef.current))); } catch (e) {}
@@ -964,9 +983,9 @@ function App() {
           if (now.pos === sent.pos && now.done === sent.done) pendingProgRef.current.delete(k);
         });
         persistPending();
-        setSyncStatus("Synced " + new Date().toLocaleTimeString());
+        markSynced();
       })
-      .catch(() => setSyncStatus("Offline - progress is saved here and will sync when you are back online"));
+      .catch((err) => markFailed(err));
   }
 
   // returns the server's entries (or null if offline); updates this browser's copy for every episode we have no unsent changes for
@@ -990,10 +1009,10 @@ function App() {
         changed[key] = readProg(key);
       });
       if (Object.keys(changed).length) setProgressMap((m) => ({ ...m, ...changed }));
-      setSyncStatus("Synced " + new Date().toLocaleTimeString());
+      markSynced();
       return entries;
     } catch (e) {
-      setSyncStatus("Offline - progress is saved here and will sync when you are back online");
+      markFailed(e);
       return null;
     }
   }
@@ -2645,7 +2664,6 @@ function App() {
                     {podcastStatus[viewingId] === "loading" ? "Loading episodes..." : "Refresh episodes"}
                   </button>
                   {" "}
-                  {syncStatus && <span className="search-subtitle" style={{ marginLeft: 6 }}>{syncStatus}</span>}
                 </React.Fragment>
               )}
               <button className="add-tracks-btn" onClick={() => openEditModal("soundtrack", viewingId)}>✏️ Edit</button>
@@ -2807,6 +2825,10 @@ function App() {
           )}
         </div>
       </div>
+
+      {syncStatus && ((viewingSoundtrack && viewingSoundtrack.feedUrl) || isExternal(playingKey)) && (
+        <div className={"sync-badge" + (syncStatus === "Offline" ? " offline" : "")}>{syncStatus}</div>
+      )}
 
       {(uploadProgress || downloadProgress) && (
         <div className="transfer-wrap">
