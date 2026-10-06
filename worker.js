@@ -377,6 +377,36 @@ export default {
       return json({ success: true, id });
     }
 
+    // ---- MusicBrainz (open music database, used to look up official track order) ----
+    // GET /api/musicbrainz?search=<text>  or  /api/musicbrainz?release=<mbid>. Pass-through only, cached for a day.
+    // MusicBrainz asks for an identifying User-Agent (browsers can't set one) and allows ~1 request/second.
+    if (path === "/api/musicbrainz" && request.method === "GET") {
+      const q = url.searchParams.get("search");
+      const releaseId = url.searchParams.get("release");
+      let target;
+      if (releaseId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(releaseId)) {
+        target = "https://musicbrainz.org/ws/2/release/" + releaseId + "?inc=recordings&fmt=json";
+      } else if (q && q.length <= 200) {
+        const clean = q.replace(/[+\-&|!(){}\[\]^"~*?:\\\/]/g, " ").replace(/\s+/g, " ").trim();
+        target = "https://musicbrainz.org/ws/2/release/?query=" + encodeURIComponent(clean) + "&limit=25&fmt=json";
+      } else {
+        return new Response("Bad request", { status: 400, headers: corsHeaders });
+      }
+      try {
+        const res = await fetch(target, {
+          headers: { "User-Agent": "MyMusicPersonalApp/1.0 (personal use)", "Accept": "application/json" },
+          cf: { cacheTtl: 86400, cacheEverything: true },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return new Response("MusicBrainz returned " + res.status, { status: 502, headers: corsHeaders });
+        const text = await res.text();
+        if (text.length > 2000000) return new Response("Too large", { status: 413, headers: corsHeaders });
+        return new Response(text, { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response("Could not reach MusicBrainz", { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- tracks ----
 
     // POST /api/rename-track { id, key, name }

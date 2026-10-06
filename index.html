@@ -699,6 +699,43 @@ function fmtLeft(sec) {
   return m >= 60 ? Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m left" : m + "m left";
 }
 
+// ---- official track order matching (used by "Try Order") ----
+function normTitle(str, stripNum) {
+  let t = stripExt(String(str || "")).toLowerCase();
+  if (stripNum) t = t.replace(/^\s*\d{1,3}[\s.\-_)]+/, ""); // leading track number in a filename: "03 - Name"
+  return t.replace(/\(.*?\)|\[.*?\]/g, " ").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+}
+function titleScore(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (Math.min(a.length, b.length) >= 3 && (a.includes(b) || b.includes(a))) return 0.9;
+  const wa = new Set(a.split(" ")), wb = new Set(b.split(" "));
+  let common = 0;
+  wa.forEach((w) => { if (wb.has(w)) common++; });
+  return common / (wa.size + wb.size - common);
+}
+// official: [{ title }] in official order; tracks: your tracks. Returns { rows, matched } where rows follow the official order,
+// and files with no match are appended at the end in their current order.
+function matchOfficialOrder(tracks, official) {
+  const off = official.map((o) => ({ ...o, norms: [o.title, ...(o.alts || [])].map((t) => normTitle(t, false)) }));
+  const files = tracks.map((t) => ({ t, norm: normTitle(t.name, true) }));
+  const pairs = [];
+  off.forEach((o, oi) => files.forEach((f, fi) => {
+    const sc = Math.max(...o.norms.map((n) => titleScore(f.norm, n)));
+    if (sc >= 0.6) pairs.push({ oi, fi, sc });
+  }));
+  pairs.sort((a, b) => b.sc - a.sc || Math.abs(a.oi - a.fi) - Math.abs(b.oi - b.fi));
+  const offTaken = {}, fileTaken = {}, byOff = {};
+  pairs.forEach((p) => {
+    if (offTaken[p.oi] || fileTaken[p.fi]) return;
+    offTaken[p.oi] = true; fileTaken[p.fi] = true; byOff[p.oi] = p.fi;
+  });
+  const rows = [];
+  off.forEach((o, oi) => { if (byOff[oi] !== undefined) rows.push({ official: o.title, track: files[byOff[oi]].t }); });
+  files.forEach((f, fi) => { if (!fileTaken[fi]) rows.push({ official: null, track: f.t }); });
+  return { rows, matched: Object.keys(byOff).length };
+}
+
 const isExternal = (key) => /^https?:\/\//i.test(key || "");
 
 // parses podcast RSS XML into { title, description, artist, cover, tracks } (tracks use the episode audio url as their key)
@@ -1398,6 +1435,8 @@ function App() {
     if (!viewingSoundtrack) return;
     setMetaQuery(viewingSoundtrack.name);
     setMetaResults([]);
+    setOrderResults([]);
+    setOrderPreview(null);
     setMetaSearchAttempted(false);
     setShowMetaResults(true);
   }
@@ -1406,6 +1445,8 @@ function App() {
     if (!metaQuery.trim()) return;
     setMetaSearching(true);
     setMetaResults([]);
+    setOrderResults([]);
+    setOrderPreview(null);
     setMetaSearchAttempted(true);
     try {
       setMetaResults(await searchSource(source, metaQuery.trim()));
@@ -1442,6 +1483,128 @@ function App() {
     setShowMetaResults(false);
     setMetaResults([]);
     loadLibrary();
+  }
+
+  // ---- "Try Order": only changes track order, never metadata ----
+  const [orderResults, setOrderResults] = useState([]);
+  const [orderPreview, setOrderPreview] = useState(null); // { album, rows, matched, total, officialCount }
+  const [orderBusy, setOrderBusy] = useState(false);
+
+  async function mbFetch(query) {
+    const res = await fetch(WORKER_URL + "/api/musicbrainz?" + query, { headers: { "X-Auth-Token": token } });
+    if (!res.ok) {
+      throw new Error(res.status === 404
+        ? "The Worker has no /api/musicbrainz endpoint yet. Run wrangler deploy with the new worker.js."
+        : "MusicBrainz lookup failed (HTTP " + res.status + "). It limits requests, so wait a few seconds and try again.");
+    }
+    return res.json();
+  }
+
+  async function handleOrderSearch(source) {
+    const q = metaQuery.trim();
+    if (!q) return;
+    setMetaResults([]);
+    setOrderResults([]);
+    setOrderPreview(null);
+    setMetaSearchAttempted(true);
+    setOrderBusy(true);
+    try {
+      if (source === "musicbrainz") {
+        const data = await mbFetch("search=" + encodeURIComponent(q));
+        const mineCount = viewingId ? library.soundtracks[viewingId].tracks.length : 0;
+        const seen = new Set();
+        const list = [];
+        (data.releases || []).forEach((r) => {
+          const tc = r["track-count"] || 0;
+          const key = (r.title || "").toLowerCase() + "|" + tc; // many editions of one album: keep the best-scoring one
+          if (seen.has(key)) return;
+          seen.add(key);
+          list.push({
+            source: "musicbrainz", id: r.id, name: r.title || "Untitled",
+            artist: (r["artist-credit"] || []).map((a) => a.name).join(", "),
+            year: r.date ? r.date.slice(0, 4) : null, trackCount: tc, coverUrl: null,
+            score: r.score || 0, sameCount: tc === mineCount,
+            note: tc === mineCount ? "same track count as yours" : "",
+          });
+        });
+        list.sort((a, b) => (b.sameCount ? 1 : 0) - (a.sameCount ? 1 : 0) || b.score - a.score);
+        setOrderResults(list.slice(0, 12));
+      } else {
+        const res = await fetch("https://itunes.apple.com/search?term=" + encodeURIComponent(q) + "&entity=album&limit=8");
+        const data = await res.json();
+        setOrderResults((data.results || []).map((r) => ({
+          source: "itunes", id: r.collectionId, name: r.collectionName, artist: r.artistName,
+          year: r.releaseDate ? r.releaseDate.slice(0, 4) : null, trackCount: r.trackCount,
+          coverUrl: r.artworkUrl100 || null,
+        })));
+      }
+    } catch (e) {
+      alert("Search failed: " + e.message);
+    }
+    setOrderBusy(false);
+  }
+
+  async function previewOrder(album) {
+    if (!viewingId) return;
+    setOrderBusy(true);
+    try {
+      let official;
+      if (album.source === "musicbrainz") {
+        const data = await mbFetch("release=" + encodeURIComponent(album.id));
+        official = [];
+        (data.media || []).forEach((m) => (m.tracks || []).forEach((t) => { if (t.title) official.push({ title: t.title }); }));
+      } else {
+        const res = await fetch("https://itunes.apple.com/lookup?id=" + album.id + "&entity=song&limit=200");
+        const data = await res.json();
+        official = (data.results || [])
+          .filter((r) => r.wrapperType === "track" && r.trackName)
+          .sort((a, b) => (a.discNumber || 1) - (b.discNumber || 1) || (a.trackNumber || 0) - (b.trackNumber || 0))
+          .map((r) => ({ title: r.trackName }));
+      }
+      if (official.length === 0) throw new Error("That release has no track list");
+      const tracks = library.soundtracks[viewingId].tracks;
+      const { rows, matched } = matchOfficialOrder(tracks, official);
+      setOrderPreview({ album, rows, matched, total: tracks.length, officialCount: official.length });
+    } catch (e) {
+      alert("Could not load the track list: " + e.message);
+    }
+    setOrderBusy(false);
+  }
+
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+
+  // build the official list from pasted text: one track per line; leading numbers and trailing durations are ignored
+  function previewPastedTracklist() {
+    if (!viewingId) return;
+    const official = pasteText.split(/\r?\n/)
+      .map((l) => l.replace(/\t.*$/, "").replace(/\s+\d{1,2}:\d{2}(:\d{2})?\s*$/, "").replace(/^\s*\d{1,3}[\s.\-_)]+/, "").trim())
+      .filter((l) => l && !/^(disc|cd|disk)\s*\d+/i.test(l))
+      .map((title) => ({ title }));
+    if (official.length === 0) return;
+    const tracks = library.soundtracks[viewingId].tracks;
+    const { rows, matched } = matchOfficialOrder(tracks, official);
+    setOrderResults([]);
+    setOrderPreview({ album: { name: "Pasted tracklist" }, rows, matched, total: tracks.length, officialCount: official.length });
+  }
+
+  async function applyTrackOrder() {
+    if (!orderPreview || !viewingId) return;
+    setOrderBusy(true);
+    try {
+      await authedFetch("/api/reorder-tracks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: viewingId, order: orderPreview.rows.map((r) => r.track.key) }),
+      });
+      setShowMetaResults(false);
+      setOrderPreview(null);
+      setOrderResults([]);
+      loadLibrary();
+    } catch (e) {
+      alert("Could not apply order: " + e.message);
+    }
+    setOrderBusy(false);
   }
 
   const [showEditModal, setShowEditModal] = useState(false);
@@ -2367,7 +2530,67 @@ function App() {
                         {metaSearching ? "Searching..." : "🎮 IGDB"}
                       </button>
                     </div>
-                    {metaSearchAttempted && !metaSearching && metaResults.length === 0 && (
+                    <div className="search-subtitle" style={{ marginTop: 10, marginBottom: 6 }}>Track order only (metadata is not changed):</div>
+                    <div className="lookup-buttons">
+                      <button type="button" onClick={() => handleOrderSearch("itunes")} disabled={!metaQuery.trim() || orderBusy || metaSearching}>
+                        {orderBusy && !orderPreview ? "Searching..." : "Try Order (iTunes)"}
+                      </button>
+                      <button type="button" onClick={() => handleOrderSearch("musicbrainz")} disabled={!metaQuery.trim() || orderBusy || metaSearching}>
+                        {orderBusy && !orderPreview ? "Searching..." : "Try Order (MusicBrainz)"}
+                      </button>
+                      <button type="button" onClick={() => setShowPaste(!showPaste)}>Paste tracklist</button>
+                    </div>
+                    {showPaste && !orderPreview && (
+                      <div style={{ marginTop: 10 }}>
+                        <textarea
+                          className="search-input"
+                          style={{ width: "100%", height: 140, marginBottom: 8, resize: "vertical" }}
+                          placeholder="Paste a tracklist from VGMdb, Steam, Wikipedia, Bandcamp... one track per line (numbers and times are ignored)"
+                          value={pasteText}
+                          onChange={(e) => setPasteText(e.target.value)}
+                        />
+                        <div className="lookup-buttons">
+                          <button type="button" onClick={previewPastedTracklist} disabled={!pasteText.trim()}>Preview order</button>
+                        </div>
+                      </div>
+                    )}
+                    {orderResults.length > 0 && !orderPreview && (
+                      <div className="online-results" style={{ marginTop: 10 }}>
+                        {orderResults.map((r, i) => (
+                          <div key={i} className="online-result" onClick={() => !orderBusy && previewOrder(r)}>
+                            {r.coverUrl && <img src={r.coverUrl} className="online-result-thumb" />}
+                            <div style={{ minWidth: 0 }}>
+                              <div className="online-result-name">{r.name}</div>
+                              <div className="online-result-sub">{r.artist}{r.year ? " - " + r.year : ""}{r.trackCount ? " - " + r.trackCount + " tracks" : ""}{r.note ? " - " + r.note : ""}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {orderPreview && (
+                      <div style={{ marginTop: 10 }}>
+                        <div className="search-subtitle" style={{ marginBottom: 6 }}>
+                          {orderPreview.album.name}: matched {orderPreview.matched} of {orderPreview.total} of your tracks
+                          {orderPreview.matched < orderPreview.officialCount ? " (" + orderPreview.officialCount + " on the release)" : ""}.
+                          {orderPreview.matched < orderPreview.total ? " Unmatched tracks go to the end." : ""}
+                        </div>
+                        <div style={{ maxHeight: 240, overflowY: "auto", fontSize: 13, marginBottom: 10 }}>
+                          {orderPreview.rows.map((r, i) => (
+                            <div key={r.track.key} style={{ display: "flex", gap: 8, padding: "3px 0", opacity: r.official ? 1 : 0.55 }}>
+                              <span style={{ width: 24, textAlign: "right", flexShrink: 0 }}>{i + 1}</span>
+                              <span style={{ minWidth: 0 }}>{stripExt(r.track.name)}{!r.official && " (no match)"}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="lookup-buttons">
+                          <button type="button" onClick={applyTrackOrder} disabled={orderBusy || orderPreview.matched === 0}>
+                            {orderBusy ? "Applying..." : "Apply order"}
+                          </button>
+                          <button type="button" onClick={() => setOrderPreview(null)} disabled={orderBusy}>Back</button>
+                        </div>
+                      </div>
+                    )}
+                    {metaSearchAttempted && !metaSearching && !orderBusy && metaResults.length === 0 && orderResults.length === 0 && !orderPreview && (
                       <div className="search-subtitle" style={{marginTop: 10}}>No matches found for "{metaQuery}".</div>
                     )}
                     {metaResults.length > 0 && (
