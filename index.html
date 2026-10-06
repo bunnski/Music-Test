@@ -722,14 +722,13 @@ function pruneProg(touchKey) {
   } catch (e) {}
 }
 
-// writes progress locally and stamps it with the time, so devices can tell whose copy is newer
+// writes progress to this browser (the offline copy; the server is the source of truth when online)
 function saveProg(key, patch) {
   try {
     const next = { ...readProg(key), ...patch };
     if (next.pos > 0) localStorage.setItem("pos:" + key, String(Math.floor(next.pos))); else localStorage.removeItem("pos:" + key);
     if (next.dur > 0) localStorage.setItem("dur:" + key, String(Math.floor(next.dur)));
     if (next.done) localStorage.setItem("done:" + key, "1"); else localStorage.removeItem("done:" + key);
-    localStorage.setItem("t:" + key, String(Date.now()));
     pruneProg(key);
   } catch (e) {}
 }
@@ -919,72 +918,108 @@ function App() {
     setProgressMap((m) => ({ ...m, [key]: readProg(key) }));
   }
 
-  // ---- progress sync: local first, then batched to the Worker (small FIFO-capped file) ----
-  const pendingProgRef = useRef(new Set());
-  const lastSavedSecRef = useRef(-1);
+  // ---- progress sync: Cloudflare is the source of truth; this browser keeps an offline copy ----
+  // Online: positions are pushed to the Worker while you listen, and every other device simply shows what the server has.
+  // Offline: changes are kept (also across restarts) and pushed as soon as the connection is back.
+  const loadPending = () => { try { return new Set(JSON.parse(localStorage.getItem("prog:pending") || "[]")); } catch (e) { return new Set(); } };
+  const pendingProgRef = useRef(null);
+  if (pendingProgRef.current === null) pendingProgRef.current = loadPending();
+  const playingKeyRef = useRef(null);
+  const lastSavedAtRef = useRef(0);
+  const lastFlushRef = useRef(0);
+  const [syncStatus, setSyncStatus] = useState("");
+
+  function persistPending() {
+    try { localStorage.setItem("prog:pending", JSON.stringify(Array.from(pendingProgRef.current))); } catch (e) {}
+  }
 
   function recordProg(key, patch) {
     saveProg(key, patch);
     pendingProgRef.current.add(key);
+    persistPending();
     refreshProg(key);
   }
 
   function flushProgress(useBeacon) {
     const keys = Array.from(pendingProgRef.current);
     if (keys.length === 0) return;
-    pendingProgRef.current.clear();
-    const updates = keys.map((k) => {
-      const p = readProg(k);
-      return { key: k, pos: p.pos, dur: p.dur, done: p.done, t: parseInt(localStorage.getItem("t:" + k) || String(Date.now()), 10) };
-    });
+    lastFlushRef.current = Date.now();
+    const updates = keys.map((k) => { const p = readProg(k); return { key: k, pos: p.pos, dur: p.dur, done: p.done }; });
     const body = JSON.stringify({ updates });
     if (useBeacon && navigator.sendBeacon) {
       // text/plain keeps it a "simple" request so it can be sent while the page is closing; the token rides in the query string
-      const ok = navigator.sendBeacon(WORKER_URL + "/api/progress?token=" + encodeURIComponent(token), new Blob([body], { type: "text/plain" }));
-      if (!ok) keys.forEach((k) => pendingProgRef.current.add(k));
+      if (navigator.sendBeacon(WORKER_URL + "/api/progress?token=" + encodeURIComponent(token), new Blob([body], { type: "text/plain" }))) {
+        keys.forEach((k) => pendingProgRef.current.delete(k));
+        persistPending();
+      }
       return;
     }
-    fetch(WORKER_URL + "/api/progress", { method: "POST", headers: { "X-Auth-Token": token }, body })
-      .then((r) => { if (!r.ok) throw new Error(); })
-      .catch(() => keys.forEach((k) => pendingProgRef.current.add(k))); // try again next time
+    fetch(WORKER_URL + "/api/progress", { method: "POST", headers: { "X-Auth-Token": token }, body, cache: "no-store" })
+      .then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        keys.forEach((k) => {
+          // only forget an episode if it hasn't changed again while the request was in flight
+          const now = readProg(k);
+          const sent = updates.find((u) => u.key === k);
+          if (now.pos === sent.pos && now.done === sent.done) pendingProgRef.current.delete(k);
+        });
+        persistPending();
+        setSyncStatus("Synced " + new Date().toLocaleTimeString());
+      })
+      .catch(() => setSyncStatus("Offline - progress is saved here and will sync when you are back online"));
   }
 
+  // returns the server's entries (or null if offline); updates this browser's copy for every episode we have no unsent changes for
   async function pullProgress() {
     try {
-      const res = await fetch(WORKER_URL + "/api/progress", { headers: { "X-Auth-Token": token } });
-      if (!res.ok) return;
-      const data = await res.json();
+      const res = await fetch(WORKER_URL + "/api/progress", { headers: { "X-Auth-Token": token }, cache: "no-store" });
+      if (!res.ok) throw new Error();
+      const entries = (await res.json()).entries || {};
       const changed = {};
-      Object.entries(data.entries || {}).forEach(([key, e]) => {
-        const localT = parseInt(localStorage.getItem("t:" + key) || "0", 10);
-        if (e.t <= localT) return; // this device already has newer progress
+      Object.entries(entries).forEach(([key, e]) => {
+        if (pendingProgRef.current.has(key)) return; // we have newer changes still waiting to be sent
+        if (key === playingKeyRef.current && audioRef.current && !audioRef.current.paused) return; // never fight the episode playing right now
+        const cur = readProg(key);
+        if (cur.pos === e.pos && cur.done === e.done && cur.dur === e.dur) return;
         try {
           if (e.pos > 0) localStorage.setItem("pos:" + key, String(e.pos)); else localStorage.removeItem("pos:" + key);
           if (e.dur > 0) localStorage.setItem("dur:" + key, String(e.dur));
           if (e.done) localStorage.setItem("done:" + key, "1"); else localStorage.removeItem("done:" + key);
-          localStorage.setItem("t:" + key, String(e.t));
           pruneProg(key);
         } catch (err) {}
         changed[key] = readProg(key);
       });
       if (Object.keys(changed).length) setProgressMap((m) => ({ ...m, ...changed }));
-    } catch (e) {}
+      setSyncStatus("Synced " + new Date().toLocaleTimeString());
+      return entries;
+    } catch (e) {
+      setSyncStatus("Offline - progress is saved here and will sync when you are back online");
+      return null;
+    }
   }
 
   useEffect(() => {
+    flushProgress(false);
     pullProgress();
-    const timer = setInterval(() => flushProgress(false), 30000);
+    // timers are throttled in background tabs, so pushing while playing is also driven by the audio's own timeupdate
+    const timer = setInterval(() => {
+      flushProgress(false);
+      if (document.visibilityState === "visible") pullProgress();
+    }, 15000);
     function onVis() {
       if (document.visibilityState === "hidden") flushProgress(true);
-      else pullProgress(); // coming back to the app: pick up progress from other devices
+      else { flushProgress(false); pullProgress(); }
     }
     function onHide() { flushProgress(true); }
+    function onOnline() { flushProgress(false); pullProgress(); }
     document.addEventListener("visibilitychange", onVis);
     window.addEventListener("pagehide", onHide);
+    window.addEventListener("online", onOnline);
     return () => {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("online", onOnline);
     };
   }, []);
 
@@ -2130,6 +2165,11 @@ function App() {
     if (audioRef.current) audioRef.current.loop = loopTrack;
   }, [loopTrack]);
 
+  playingKeyRef.current = playingKey;
+
+  const [muted, setMuted] = useState(false);
+  useEffect(() => { if (audioRef.current) audioRef.current.muted = muted; }, [muted]);
+
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = Math.pow(volumePercent / 100, 2);
     localStorage.setItem("volumePercent", volumePercent);
@@ -2605,6 +2645,7 @@ function App() {
                     {podcastStatus[viewingId] === "loading" ? "Loading episodes..." : "Refresh episodes"}
                   </button>
                   {" "}
+                  {syncStatus && <span className="search-subtitle" style={{ marginLeft: 6 }}>{syncStatus}</span>}
                 </React.Fragment>
               )}
               <button className="add-tracks-btn" onClick={() => openEditModal("soundtrack", viewingId)}>✏️ Edit</button>
@@ -2799,9 +2840,10 @@ function App() {
           onTimeUpdate={(e) => {
             const t = e.target.currentTime;
             setCurrentTime(t);
-            if (isExternal(playingKey) && Math.floor(t) % 5 === 0 && t > 5 && Math.floor(t) !== lastSavedSecRef.current) {
-              lastSavedSecRef.current = Math.floor(t);
+            if (isExternal(playingKey) && t > 5 && Date.now() - lastSavedAtRef.current >= 5000) {
+              lastSavedAtRef.current = Date.now();
               recordProg(playingKey, { pos: t, dur: e.target.duration || 0, done: false });
+              if (Date.now() - lastFlushRef.current >= 15000) flushProgress(false); // live push every ~15s of playback
             }
           }}
           onLoadedMetadata={(e) => {
@@ -2811,6 +2853,13 @@ function App() {
                 const saved = parseInt(localStorage.getItem("pos:" + playingKey) || "0", 10);
                 if (saved > 5 && saved < e.target.duration - 10) e.target.currentTime = saved;
               } catch (err) {}
+              const el = e.target, key = playingKey;
+              pullProgress().then((entries) => {
+                const srv = entries && entries[key];
+                if (srv && !pendingProgRef.current.has(key) && playingKeyRef.current === key && srv.pos > 5 && srv.pos < el.duration - 10 && Math.abs(el.currentTime - srv.pos) > 3) {
+                  el.currentTime = srv.pos; // the server knows where you really got to
+                }
+              });
             }
           }}
           style={{ display: "none" }}
@@ -2843,7 +2892,7 @@ function App() {
         <div className="bar-divider"></div>
 
         <div className="volume-control">
-          <span className="volume-icon">{volumePercent === 0 ? "🔇" : volumePercent < 50 ? "🔉" : "🔊"}</span>
+          <span className="volume-icon" style={{ cursor: "pointer", opacity: muted ? 0.5 : 1 }} title={muted ? "Unmute" : "Mute"} onClick={() => setMuted(!muted)}>{muted || volumePercent === 0 ? "🔇" : volumePercent < 50 ? "🔉" : "🔊"}</span>
           <input
             type="range"
             className="volume-bar"
