@@ -10,6 +10,8 @@
 //   renaming, reordering, and pinning are all just edits to _library.json - no file copying, instant.
 
 const LIBRARY_KEY = "_library.json";
+const PROGRESS_KEY = "_progress.json";
+const PROGRESS_MAX = 100; // episodes of saved listening progress kept (oldest dropped first)
 
 function slugify(str) {
   return str.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-+|-+$)/g, "").slice(0, 40) || "item";
@@ -405,6 +407,38 @@ export default {
       } catch (e) {
         return new Response("Could not reach MusicBrainz", { status: 502, headers: corsHeaders });
       }
+    }
+
+    // ---- podcast listening progress (synced between devices) ----
+    // One small file holds progress for the most recent PROGRESS_MAX episodes; once it is full the least recently
+    // listened ones are dropped first (FIFO). GET returns it, POST { updates: [{ key, pos, dur, done, t }] } merges
+    // (the newest "t" wins per episode). The app batches writes (about one every 30 seconds while playing).
+    if (path === "/api/progress" && request.method === "GET") {
+      const obj = await env.MUSIC_BUCKET.get(PROGRESS_KEY);
+      return json(obj ? JSON.parse(await obj.text()) : { entries: {} });
+    }
+    if (path === "/api/progress" && request.method === "POST") {
+      let body;
+      try { body = JSON.parse(await request.text()); } catch (e) {
+        return new Response("Bad JSON", { status: 400, headers: corsHeaders });
+      }
+      const updates = Array.isArray(body.updates) ? body.updates.slice(0, 50) : [];
+      const obj = await env.MUSIC_BUCKET.get(PROGRESS_KEY);
+      const data = obj ? JSON.parse(await obj.text()) : { entries: {} };
+      if (!data.entries) data.entries = {};
+      const clamp = (n) => Math.max(0, Math.min(Number(n) || 0, 259200));
+      const now = Date.now();
+      for (const u of updates) {
+        if (typeof u.key !== "string" || u.key.length > 600 || !/^https?:\/\//i.test(u.key)) continue;
+        const t = Math.min(Number(u.t) || now, now + 60000);
+        const existing = data.entries[u.key];
+        if (existing && existing.t > t) continue; // a newer update from another device already won
+        data.entries[u.key] = { pos: clamp(u.pos), dur: clamp(u.dur), done: !!u.done, t };
+      }
+      const keys = Object.keys(data.entries).sort((a, b) => data.entries[a].t - data.entries[b].t);
+      while (keys.length > PROGRESS_MAX) delete data.entries[keys.shift()]; // oldest first out
+      await env.MUSIC_BUCKET.put(PROGRESS_KEY, JSON.stringify(data));
+      return json({ success: true });
     }
 
     // ---- tracks ----
