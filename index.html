@@ -297,6 +297,10 @@
   .ep-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s linear; }
   .ep-meta { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
   .ep-done { opacity: 0.55; }
+  .row-menu-btn { display: inline-block; background: transparent; border: none; color: var(--text-dim); font-size: 16px; letter-spacing: 1px; padding: 2px 8px; margin-left: auto; flex-shrink: 0; cursor: pointer; font-family: inherit; border-radius: 6px; }
+  .row-menu-btn:hover { color: var(--text); background: rgba(255,255,255,0.08); }
+  .ep-dl-btn { background: transparent; border: 1px solid #444; color: var(--text-dim); border-radius: 12px; padding: 2px 10px; font-size: 11px; margin-left: 10px; flex-shrink: 0; cursor: pointer; font-family: inherit; }
+  .ep-dl-btn.saved { color: var(--accent); border-color: var(--accent); }
   .sync-badge {
     position: fixed; top: 12px; right: 16px; z-index: 50;
     background: #181818; border: 1px solid #333; border-radius: 12px;
@@ -740,6 +744,18 @@ function saveProg(key, patch) {
   } catch (e) {}
 }
 
+// ---- downloaded podcast episodes (kept in this browser's offline cache; oldest downloads are removed first) ----
+function readDl() { try { return JSON.parse(localStorage.getItem("podcast:downloads") || "[]"); } catch (e) { return []; } }
+function writeDl(list) { try { localStorage.setItem("podcast:downloads", JSON.stringify(list)); } catch (e) {} }
+function getDlSettings() {
+  return { deleteAfterPlayed: localStorage.getItem("podcast:delplayed") === "1" }; // off unless you turn it on
+}
+// episodes the app removed to make room, per podcast, so auto-download does not fetch them again
+function readEvicted(pid) { try { return JSON.parse(localStorage.getItem("podcast:evicted:" + pid) || "[]"); } catch (e) { return []; } }
+function writeEvicted(pid, list) { try { localStorage.setItem("podcast:evicted:" + pid, JSON.stringify(list.slice(-300))); } catch (e) {} }
+function getCap(id) { return parseInt(localStorage.getItem("podcap:" + id) || "10", 10); } // per podcast
+function getAutoCount(id) { return parseInt(localStorage.getItem("podauto:" + id) || "0", 10); }
+
 function fmtLeft(sec) {
   const m = Math.max(1, Math.ceil(sec / 60));
   return m >= 60 ? Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m left" : m + "m left";
@@ -780,6 +796,21 @@ function matchOfficialOrder(tracks, official) {
   off.forEach((o, oi) => { if (byOff[oi] !== undefined) rows.push({ official: o.title, track: files[byOff[oi]].t }); });
   files.forEach((f, fi) => { if (!fileTaken[fi]) rows.push({ official: null, track: f.t }); });
   return { rows, matched: Object.keys(byOff).length };
+}
+
+// the "..." button shown on touch screens: opens the same menu as right-click for the row it sits in
+function RowMenuBtn() {
+  return (
+    <button
+      className="row-menu-btn"
+      onClick={(e) => {
+        e.stopPropagation();
+        const row = e.currentTarget.parentElement;
+        const r = e.currentTarget.getBoundingClientRect();
+        row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: Math.max(8, r.right - 190), clientY: r.bottom }));
+      }}
+    >...</button>
+  );
 }
 
 const isExternal = (key) => /^https?:\/\//i.test(key || "");
@@ -884,6 +915,7 @@ function App() {
     let timer = null, startX = 0, startY = 0, fired = false;
     function cancel() { clearTimeout(timer); timer = null; }
     function onStart(e) {
+      fired = false; // must reset first: a leftover "fired" would cancel the click on the next tap, e.g. on a menu item
       if (e.touches.length !== 1) return cancel();
       const t = e.target;
       if (t.closest && t.closest("input, textarea, select, .context-menu, .modal-panel")) return;
@@ -897,7 +929,7 @@ function App() {
     function onMove(e) {
       if (Math.abs(e.touches[0].clientX - startX) > 10 || Math.abs(e.touches[0].clientY - startY) > 10) cancel();
     }
-    function onEnd(e) { cancel(); if (fired && e.cancelable) e.preventDefault(); } // swallow the click after a long-press
+    function onEnd(e) { cancel(); if (fired && e.cancelable) e.preventDefault(); fired = false; } // swallow the click that follows a long-press, once
     document.addEventListener("touchstart", onStart, { passive: true });
     document.addEventListener("touchmove", onMove, { passive: true });
     document.addEventListener("touchend", onEnd, { passive: false });
@@ -1044,6 +1076,7 @@ function App() {
 
   function markPlayed(key) {
     recordProg(key, { pos: 0, done: true });
+    if (getDlSettings().deleteAfterPlayed) removeEpisodeDownload(key);
     flushProgress(false);
     setContextMenu(null);
   }
@@ -1083,6 +1116,7 @@ function App() {
       podcastCacheRef.current[id] = { tracks: feed.tracks, at: Date.now() };
       setLibrary((prev) => prev.soundtracks[id] ? { ...prev, soundtracks: { ...prev.soundtracks, [id]: { ...prev.soundtracks[id], tracks: feed.tracks } } } : prev);
       setPodcastStatus((p) => ({ ...p, [id]: null }));
+      runAutoDownload(id, feed.tracks);
     } catch (e) {
       podcastCacheRef.current[id] = { tracks: c ? c.tracks : [], at: Date.now() }; // avoid retry loops
       setPodcastStatus((p) => ({ ...p, [id]: "Could not load episodes: " + e.message }));
@@ -1103,6 +1137,171 @@ function App() {
   useEffect(() => {
     if (viewingId) fetchPodcastEpisodes(viewingId);
   }, [viewingId, library.soundtracks[viewingId] ? library.soundtracks[viewingId].feedUrl : null]);
+
+  // ---- podcast episode downloads ----
+  const [dlIndex, setDlIndex] = useState(readDl);
+  const [dlActive, setDlActive] = useState(null); // { key, loaded, total }
+  const [dlQueued, setDlQueued] = useState([]);
+  const [dlSettings, setDlSettings] = useState(() => ({ ...getDlSettings() }));
+  const [showDlModal, setShowDlModal] = useState(false);
+  const dlQueueRef = useRef([]);
+  const dlRunningRef = useRef(false);
+
+  const isDl = (key) => dlIndex.some((d) => d.key === key);
+
+  function episodeInfo(key) {
+    for (const st of Object.values(library.soundtracks)) {
+      if (!st.feedUrl) continue;
+      const t = st.tracks.find((x) => x.key === key);
+      if (t) return { pid: st.id, date: t.date || 0 };
+    }
+    return { pid: "", date: 0 };
+  }
+
+  // manual = you pressed Save (kept until you remove it); otherwise it is an auto-download (rotates out, oldest release first)
+  function downloadEpisode(key, title, manual, pid, rel) {
+    if (readDl().some((d) => d.key === key)) return;
+    const info = episodeInfo(key);
+    if (!dlQueueRef.current.some((q) => q.key === key)) dlQueueRef.current.push({ key, title, manual, pid: pid || info.pid, rel: rel || info.date });
+    setDlQueued(dlQueueRef.current.map((q) => q.key));
+    runDlQueue();
+  }
+
+  async function runDlQueue() {
+    if (dlRunningRef.current) return;
+    dlRunningRef.current = true;
+    while (dlQueueRef.current.length) {
+      const { key, title, manual, pid, rel } = dlQueueRef.current.shift();
+      setDlQueued(dlQueueRef.current.map((q) => q.key));
+      if (readDl().some((d) => d.key === key)) continue;
+      try {
+        setDlActive({ key, loaded: 0, total: 0 });
+        const res = await fetch(WORKER_URL + "/api/podcast-audio?url=" + encodeURIComponent(key), { headers: { "X-Auth-Token": token } });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const type = res.headers.get("Content-Type") || "audio/mpeg";
+        const total = parseInt(res.headers.get("Content-Length") || "0", 10);
+        const reader = res.body.getReader();
+        const chunks = [];
+        let loaded = 0, lastShown = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.length;
+          if (Date.now() - lastShown > 250) { lastShown = Date.now(); setDlActive({ key, loaded, total }); }
+        }
+        const blob = new Blob(chunks, { type });
+        const cache = await caches.open(OFFLINE_CACHE);
+        await cache.put(key, new Response(blob, { status: 200, headers: { "Content-Type": type } }));
+        const list = readDl().filter((d) => d.key !== key);
+        list.push({ key, size: blob.size, t: Date.now(), title: title || "", pid, auto: !manual, rel: rel || 0 });
+        if (manual && pid) writeEvicted(pid, readEvicted(pid).filter((k) => k !== key)); // you asked for it, so it is no longer "removed to make room"
+        writeDl(list);
+        await enforceDlCap(key, pid);
+        setDlIndex(readDl());
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      } catch (e) {
+        console.warn("episode download failed:", e);
+        if (manual) alert("Download failed: " + e.message);
+      }
+      setDlActive(null);
+    }
+    dlRunningRef.current = false;
+  }
+
+  // Keep at most this podcast's cap of AUTO-downloaded episodes: the oldest release goes first. Episodes you saved yourself
+  // are never removed here, and neither is the one playing right now.
+  async function enforceDlCap(justKey, pid) {
+    if (!pid) return;
+    const cap = getCap(pid);
+    let list = readDl();
+    const cache = await caches.open(OFFLINE_CACHE);
+    const evicted = readEvicted(pid);
+    const isAuto = (d) => d.auto && (d.pid || episodeInfo(d.key).pid) === pid;
+    while (list.filter(isAuto).length > cap) {
+      const candidates = list
+        .filter((d) => isAuto(d) && d.key !== justKey && d.key !== playingKeyRef.current)
+        .sort((a, b) => (a.rel || 0) - (b.rel || 0) || a.t - b.t);
+      if (candidates.length === 0) break;
+      const victim = candidates[0];
+      list = list.filter((d) => d.key !== victim.key);
+      await cache.delete(victim.key);
+      evicted.push(victim.key); // remembered so auto-download doesn't fetch it again
+    }
+    writeEvicted(pid, evicted);
+    writeDl(list);
+    setDlIndex(list);
+  }
+
+  function keepDownload(key) {
+    writeDl(readDl().map((d) => (d.key === key ? { ...d, auto: false } : d)));
+    setDlIndex(readDl());
+  }
+
+  async function removeEpisodeDownload(key) {
+    const cache = await caches.open(OFFLINE_CACHE);
+    await cache.delete(key);
+    writeDl(readDl().filter((d) => d.key !== key));
+    setDlIndex(readDl());
+  }
+
+  async function removeDownloads(pid) {
+    const inScope = (d) => !pid || (d.pid || episodeInfo(d.key).pid) === pid;
+    const victims = readDl().filter(inScope);
+    if (victims.length === 0) return;
+    if (!window.confirm(pid ? "Remove this podcast's downloaded episodes from this device?" : "Remove ALL downloaded podcast episodes from this device?")) return;
+    const cache = await caches.open(OFFLINE_CACHE);
+    for (const d of victims) await cache.delete(d.key);
+    writeDl(readDl().filter((d) => !inScope(d)));
+    setDlIndex(readDl());
+  }
+
+  // make sure the newest N episodes (by release date) of a podcast with auto-download on are downloaded
+  function runAutoDownload(id, tracks) {
+    const n = Math.min(getAutoCount(id), getCap(id));
+    if (!n || navigator.onLine === false) return;
+    const evicted = readEvicted(id);
+    const have = readDl();
+    [...tracks].sort((a, b) => (b.date || 0) - (a.date || 0)).slice(0, n).forEach((t) => {
+      if (have.some((d) => d.key === t.key) || evicted.includes(t.key) || readProg(t.key).done) return;
+      downloadEpisode(t.key, t.name, false, id, t.date || 0);
+    });
+  }
+
+  // auto-download only works while the app is open, so check on start and every half hour
+  useEffect(() => {
+    function check() {
+      Object.values(library.soundtracks).forEach((st) => {
+        if (st.feedUrl && getAutoCount(st.id) > 0) fetchPodcastEpisodes(st.id);
+      });
+    }
+    check();
+    const timer = setInterval(check, 30 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [Object.keys(library.soundtracks).length]);
+
+  function setAuto(id, n) {
+    try { localStorage.setItem("podauto:" + id, String(n)); } catch (e) {}
+    writeEvicted(id, []); // a changed setting starts fresh
+    setDlSettings((s) => ({ ...s }));
+    const cached = podcastCacheRef.current[id];
+    if (n > 0 && cached) runAutoDownload(id, cached.tracks);
+  }
+
+  function setCap(id, n) {
+    const old = getCap(id);
+    try { localStorage.setItem("podcap:" + id, String(n)); } catch (e) {}
+    if (n > old) writeEvicted(id, []); // more room now, so earlier removals can be fetched again
+    setDlSettings((s) => ({ ...s }));
+    enforceDlCap(null, id);
+    const cached = podcastCacheRef.current[id];
+    if (n > old && cached) runAutoDownload(id, cached.tracks);
+  }
+
+  function setDeleteAfterPlayed(v) {
+    try { localStorage.setItem("podcast:delplayed", v ? "1" : "0"); } catch (e) {}
+    setDlSettings((s) => ({ ...s, deleteAfterPlayed: v }));
+  }
 
   function openPodcastModal(parentId) {
     setPodcastParent(parentId || null);
@@ -1254,9 +1453,23 @@ function App() {
     return keys;
   }
 
+  // Cache Storage only accepts http(s) addresses, so give every file an explicit https cache key. (A relative key breaks when the
+  // page is opened from a file:// path, and ties downloads to whichever address the site happens to be served from.)
+  function offlineKey(key) {
+    if (isExternal(key)) return key;
+    return WORKER_URL + "/offline/" + String(key).split("/").map(encodeURIComponent).join("/");
+  }
+
+  // finds a downloaded file, also accepting downloads saved under the old relative key
+  async function cacheMatch(cache, key) {
+    const hit = await cache.match(offlineKey(key));
+    if (hit) return hit;
+    try { return await cache.match(key); } catch (e) { return undefined; }
+  }
+
   async function isDownloaded(soundtrack) {
     const cache = await caches.open(OFFLINE_CACHE);
-    const results = await Promise.all(offlineKeys(soundtrack).map((k) => cache.match(k)));
+    const results = await Promise.all(offlineKeys(soundtrack).map((k) => cacheMatch(cache, k)));
     return results.length > 0 && results.every((r) => r);
   }
 
@@ -1285,20 +1498,23 @@ function App() {
       } else {
         blob = await res.blob();
       }
-      await cache.put(keys[i], new Response(blob, { status: 200, headers: { "Content-Type": type } }));
+      await cache.put(offlineKey(keys[i]), new Response(blob, { status: 200, headers: { "Content-Type": type } }));
     }
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
   }
 
   async function removeDownload(soundtrack) {
     const cache = await caches.open(OFFLINE_CACHE);
-    for (const key of offlineKeys(soundtrack)) await cache.delete(key);
+    for (const key of offlineKeys(soundtrack)) {
+      await cache.delete(offlineKey(key));
+      try { await cache.delete(key); } catch (e) {} // old relative key
+    }
   }
 
   async function getPlayableUrl(key) {
-    if (isExternal(key)) return key;
     const cache = await caches.open(OFFLINE_CACHE);
-    const cached = await cache.match(key);
+    const cached = await cacheMatch(cache, key);
+    if (!cached && isExternal(key)) return key; // not downloaded: stream from the publisher
     if (cached) {
       const blob = await cached.blob();
       return URL.createObjectURL(blob);
@@ -2060,6 +2276,7 @@ function App() {
               <div className="category-icon">📁</div>
               <span className="folder-name">{item.name}</span>
               {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
+              <RowMenuBtn />
             </div>
             {isOpen && renderItems(item.id, indentLevel + 1)}
           </React.Fragment>
@@ -2087,6 +2304,7 @@ function App() {
             )}
             <span className="folder-name">{item.name}</span>
             {excludedIds.includes(item.id) && <span className="folder-flag">no random</span>}
+            <RowMenuBtn />
           </div>
         );
       }
@@ -2109,6 +2327,7 @@ function App() {
           <span className="folder-name">{item.name}</span>
           {excludedIds.includes(item.id) && !item.feedUrl && <span className="folder-flag">no random</span>}
           {item.id === playingId && <div className="folder-playing-dot"></div>}
+          <RowMenuBtn />
         </div>
       );
     });
@@ -2246,6 +2465,7 @@ function App() {
     if (isExternal(playingKey)) {
       recordProg(playingKey, { pos: 0, done: true });
       flushProgress(false);
+      if (getDlSettings().deleteAfterPlayed) removeEpisodeDownload(playingKey);
     }
 
     if (playingPlaylistId) {
@@ -2496,6 +2716,7 @@ function App() {
                       <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
                       <span className="folder-name">{s.name}</span>
                       {s.id === playingId && <div className="folder-playing-dot"></div>}
+                      <RowMenuBtn />
                     </div>
                   );
                 }
@@ -2540,6 +2761,7 @@ function App() {
                             <div className="category-icon">📁</div>
                             <span className="folder-name">{p.name}</span>
                             {excludedIds.includes(p.id) && !p.feedUrl && <span className="folder-flag">no random</span>}
+                            <RowMenuBtn />
                           </div>
                           {pinOpen && renderItems(p.id, 1)}
                         </React.Fragment>
@@ -2563,6 +2785,7 @@ function App() {
                         <span className="folder-name">{p.name}</span>
                         {excludedIds.includes(p.id) && <span className="folder-flag">no random</span>}
                         {p.type === "soundtrack" && p.id === playingId && <div className="folder-playing-dot"></div>}
+                        <RowMenuBtn />
                       </div>
                     );
                   })}
@@ -2616,6 +2839,7 @@ function App() {
                         <div>{stripExt(track.name)}</div>
                         <div className="search-subtitle">{soundtrack.name}</div>
                       </div>
+                      <RowMenuBtn />
                     </div>
                   );
                 })
@@ -2663,6 +2887,8 @@ function App() {
                     onClick={() => { delete podcastCacheRef.current[viewingId]; fetchPodcastEpisodes(viewingId); }}>
                     {podcastStatus[viewingId] === "loading" ? "Loading episodes..." : "Refresh episodes"}
                   </button>
+                  {" "}
+                  <button className="add-tracks-btn" onClick={() => setShowDlModal(true)}>Downloads</button>
                   {" "}
                 </React.Fragment>
               )}
@@ -2804,7 +3030,11 @@ function App() {
                       const pr = isPlaying && duration > 0 ? { pos: currentTime, dur: duration, done: false } : (progressMap[track.key] || { pos: 0, dur: 0, done: false });
                       const frac = pr.done ? 1 : pr.dur > 0 ? Math.min(1, pr.pos / pr.dur) : 0;
                       const showBar = pr.done || pr.pos > 5;
+                      const entry = dlIndex.find((d) => d.key === track.key);
+                      const saved = !!entry;
+                      const active = dlActive && dlActive.key === track.key;
                       return (
+                        <React.Fragment>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div className={pr.done ? "ep-done" : ""}>{stripExt(track.name)}</div>
                           {showBar && (
@@ -2814,10 +3044,23 @@ function App() {
                             </React.Fragment>
                           )}
                         </div>
+                        <button
+                          className={"ep-dl-btn" + (saved ? " saved" : "")}
+                          title={saved ? (entry.auto ? "Auto-downloaded (rotates out). Tap to remove" : "Saved. Tap to remove") : "Download for offline"}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            if (saved) { if (window.confirm("Remove this download?")) removeEpisodeDownload(track.key); }
+                            else downloadEpisode(track.key, track.name, true, viewingId);
+                          }}
+                        >
+                          {saved ? (entry.auto ? "Auto" : "Saved") : active ? (dlActive.total ? Math.round((dlActive.loaded / dlActive.total) * 100) + "%" : "...") : dlQueued.includes(track.key) ? "Queued" : "Save"}
+                        </button>
+                        </React.Fragment>
                       );
                     })() : (
                       <span>{stripExt(track.name)}</span>
                     )}
+                    <RowMenuBtn />
                   </div>
                 );
               })}
@@ -2986,6 +3229,64 @@ function App() {
         </div>
       )}
 
+      {showDlModal && viewingSoundtrack && viewingSoundtrack.feedUrl && (
+        <div className="modal-backdrop" onClick={() => setShowDlModal(false)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Podcast downloads</h3>
+              <button className="modal-close" onClick={() => setShowDlModal(false)}>x</button>
+            </div>
+            {(() => {
+              const mine = dlIndex.filter((d) => (d.pid || episodeInfo(d.key).pid) === viewingId);
+              const autoN = mine.filter((d) => d.auto).length;
+              return (
+                <div className="search-subtitle" style={{ marginBottom: 12 }}>
+                  This podcast: {autoN} auto, {mine.length - autoN} saved by you ({fmtBytes(mine.reduce((a, d) => a + (d.size || 0), 0))}).
+                  All podcasts: {fmtBytes(dlIndex.reduce((a, d) => a + (d.size || 0), 0))}.
+                </div>
+              );
+            })()}
+            <label style={{ display: "block", marginBottom: 12, fontSize: 14 }}>
+              Auto-download for this podcast<br />
+              <select
+                style={{ marginTop: 6, background: "#222", color: "inherit", border: "1px solid #444", borderRadius: 6, padding: "6px 8px" }}
+                value={getAutoCount(viewingId)}
+                onChange={(e) => setAuto(viewingId, parseInt(e.target.value, 10))}
+              >
+                <option value={0}>Off</option>
+                <option value={1}>Latest 1 episode</option>
+                <option value={3}>Latest 3 episodes</option>
+                <option value={5}>Latest 5 episodes</option>
+                <option value={10}>Latest 10 episodes</option>
+              </select>
+            </label>
+            <label style={{ display: "block", marginBottom: 12, fontSize: 14 }}>
+              Auto-download limit<br />
+              <select
+                style={{ marginTop: 6, background: "#222", color: "inherit", border: "1px solid #444", borderRadius: 6, padding: "6px 8px" }}
+                value={getCap(viewingId)}
+                onChange={(e) => setCap(viewingId, parseInt(e.target.value, 10))}
+              >
+                {[3, 5, 10, 20, 30, 50].map((n) => <option key={n} value={n}>{n} episodes</option>)}
+              </select>
+              <div className="search-subtitle" style={{ marginTop: 4 }}>Episodes you save yourself do not count.</div>
+            </label>
+            <label style={{ display: "block", marginBottom: 12, fontSize: 14 }}>
+              <input type="checkbox" checked={dlSettings.deleteAfterPlayed} onChange={(e) => setDeleteAfterPlayed(e.target.checked)} />
+              {" "}Delete an episode after it has been played (all podcasts)
+            </label>
+            <div className="search-subtitle" style={{ marginBottom: 12 }}>
+              Auto-downloaded episodes rotate: the newest releases are fetched, and when over the limit the oldest release is removed first.
+              Episodes you save yourself are never removed automatically. The episode playing is never removed.
+              Auto-download only runs while the app is open.
+            </div>
+            <button className="add-tracks-btn" onClick={() => removeDownloads(viewingId)}>Remove this podcast's downloads</button>
+            {" "}
+            <button className="add-tracks-btn" onClick={() => removeDownloads(null)} disabled={dlIndex.length === 0}>Remove all</button>
+          </div>
+        </div>
+      )}
+
       {showEditModal && editTarget && (
         <div className="modal-backdrop" onClick={() => setShowEditModal(false)}>
           <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
@@ -3144,6 +3445,12 @@ function App() {
                 ) : (
                   isExternal(contextMenu.target.key) ? (
                     <React.Fragment>
+                      <div className="context-item" onClick={() => { const k = contextMenu.target.key; setContextMenu(null); if (isDl(k)) removeEpisodeDownload(k); else downloadEpisode(k, "", true, contextMenu.target.id || viewingId); }}>
+                        {isDl(contextMenu.target.key) ? "Remove download" : "Download episode"}
+                      </div>
+                      {dlIndex.some((d) => d.key === contextMenu.target.key && d.auto) && (
+                        <div className="context-item" onClick={() => { keepDownload(contextMenu.target.key); setContextMenu(null); }}>Keep this download</div>
+                      )}
                       <div className="context-item" onClick={() => markPlayed(contextMenu.target.key)}>Mark as played</div>
                       <div className="context-item" onClick={() => resetProg(contextMenu.target.key)}>Reset progress</div>
                     </React.Fragment>

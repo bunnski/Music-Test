@@ -409,6 +409,42 @@ export default {
       }
     }
 
+    // ---- podcast episode download (pass-through) ----
+    // GET /api/podcast-audio?url=<episode audio url>. Streams the file straight through to the browser (nothing is stored or
+    // buffered here), because podcast hosts usually block cross-site downloads. One request per episode, almost no CPU.
+    if (path === "/api/podcast-audio" && request.method === "GET") {
+      let u;
+      try { u = new URL(url.searchParams.get("url")); } catch (e) {
+        return new Response("Bad url", { status: 400, headers: corsHeaders });
+      }
+      const host = u.hostname.toLowerCase();
+      const blocked =
+        !/^https?:$/.test(u.protocol) || host === "localhost" || host.endsWith(".local") || host.endsWith(".internal") ||
+        host.includes(":") || /^(0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
+      if (blocked) return new Response("Url not allowed", { status: 400, headers: corsHeaders });
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000); // only limits waiting for the host to start answering
+      let res;
+      try {
+        res = await fetch(u.toString(), {
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; MyMusic/1.0)", "Accept": "audio/*,*/*" },
+          redirect: "follow",
+          signal: controller.signal,
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        return new Response("Could not reach host", { status: 502, headers: corsHeaders });
+      }
+      clearTimeout(timer);
+      if (!res.ok) return new Response("Host returned " + res.status, { status: 502, headers: corsHeaders });
+      const len = parseInt(res.headers.get("Content-Length") || "0", 10);
+      if (len > 400000000) return new Response("File too large", { status: 413, headers: corsHeaders });
+      const headers = { ...corsHeaders, "Content-Type": res.headers.get("Content-Type") || "audio/mpeg" };
+      if (len && !res.headers.get("Content-Encoding")) headers["Content-Length"] = String(len);
+      return new Response(res.body, { headers });
+    }
+
     // ---- podcast listening progress: Cloudflare is the source of truth ----
     // One small file holds progress for the most recent PROGRESS_MAX episodes; once it is full the least recently
     // listened ones are dropped first (FIFO). GET returns it. POST { updates: [{ key, pos, dur, done }] } overwrites
