@@ -661,10 +661,12 @@
     display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
   }
   .transfer-row { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
-  .transfer-label { flex: 0 1 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .transfer-label { flex: 0 1 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .transfer-track { flex: 1; height: 4px; background: #4a4a4a; border-radius: 2px; overflow: hidden; min-width: 40px; }
   .transfer-fill { height: 100%; background: var(--accent); transition: width 0.15s linear; }
   .transfer-pct { width: 36px; text-align: right; flex-shrink: 0; }
+  .transfer-cancel { background: transparent; border: 1px solid #444; color: var(--text-dim); border-radius: 10px; padding: 1px 9px; font-size: 11px; cursor: pointer; flex-shrink: 0; font-family: inherit; }
+  .transfer-cancel:hover { color: var(--text); border-color: var(--text-dim); }
   .transfer-detail { flex-shrink: 0; white-space: nowrap; }
   @media (max-width: 700px) {
     .transfer-wrap { padding: 6px 12px; }
@@ -891,7 +893,6 @@ function App() {
   const [viewingPlaylistId, setViewingPlaylistId] = useState(null);
   const [error, setError] = useState(null);
   const [isViewingDownloaded, setIsViewingDownloaded] = useState(false);
-  const [downloadStatus, setDownloadStatus] = useState(null);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [playingId, setPlayingId] = useState(null);
@@ -1146,6 +1147,15 @@ function App() {
   const [showDlModal, setShowDlModal] = useState(false);
   const dlQueueRef = useRef([]);
   const dlRunningRef = useRef(false);
+  const dlAbortRef = useRef(null);
+  const dlCurrentRef = useRef(null); // { key, pid, manual } of the episode downloading now
+
+  // stops queued episode downloads that match, and the running one if it matches too
+  function cancelEpisodeDownloads(match) {
+    dlQueueRef.current = dlQueueRef.current.filter((q) => !match(q));
+    setDlQueued(dlQueueRef.current.map((q) => q.key));
+    if (dlAbortRef.current && dlCurrentRef.current && match(dlCurrentRef.current)) dlAbortRef.current.abort();
+  }
 
   const isDl = (key) => dlIndex.some((d) => d.key === key);
 
@@ -1153,16 +1163,16 @@ function App() {
     for (const st of Object.values(library.soundtracks)) {
       if (!st.feedUrl) continue;
       const t = st.tracks.find((x) => x.key === key);
-      if (t) return { pid: st.id, date: t.date || 0 };
+      if (t) return { pid: st.id, date: t.date || 0, name: t.name, podcast: st.name };
     }
-    return { pid: "", date: 0 };
+    return { pid: "", date: 0, name: "", podcast: "" };
   }
 
   // manual = you pressed Save (kept until you remove it); otherwise it is an auto-download (rotates out, oldest release first)
   function downloadEpisode(key, title, manual, pid, rel) {
     if (readDl().some((d) => d.key === key)) return;
     const info = episodeInfo(key);
-    if (!dlQueueRef.current.some((q) => q.key === key)) dlQueueRef.current.push({ key, title, manual, pid: pid || info.pid, rel: rel || info.date });
+    if (!dlQueueRef.current.some((q) => q.key === key)) dlQueueRef.current.push({ key, title: title || info.name, podcast: info.podcast, manual, pid: pid || info.pid, rel: rel || info.date });
     setDlQueued(dlQueueRef.current.map((q) => q.key));
     runDlQueue();
   }
@@ -1171,12 +1181,15 @@ function App() {
     if (dlRunningRef.current) return;
     dlRunningRef.current = true;
     while (dlQueueRef.current.length) {
-      const { key, title, manual, pid, rel } = dlQueueRef.current.shift();
+      const { key, title, podcast, manual, pid, rel } = dlQueueRef.current.shift();
       setDlQueued(dlQueueRef.current.map((q) => q.key));
       if (readDl().some((d) => d.key === key)) continue;
       try {
-        setDlActive({ key, loaded: 0, total: 0 });
-        const res = await fetch(WORKER_URL + "/api/podcast-audio?url=" + encodeURIComponent(key), { headers: { "X-Auth-Token": token } });
+        setDlActive({ key, loaded: 0, total: 0, title, podcast, manual });
+        const controller = new AbortController();
+        dlAbortRef.current = controller;
+        dlCurrentRef.current = { key, pid, manual };
+        const res = await fetch(WORKER_URL + "/api/podcast-audio?url=" + encodeURIComponent(key), { headers: { "X-Auth-Token": token }, signal: controller.signal });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const type = res.headers.get("Content-Type") || "audio/mpeg";
         const total = parseInt(res.headers.get("Content-Length") || "0", 10);
@@ -1188,7 +1201,7 @@ function App() {
           if (done) break;
           chunks.push(value);
           loaded += value.length;
-          if (Date.now() - lastShown > 250) { lastShown = Date.now(); setDlActive({ key, loaded, total }); }
+          if (Date.now() - lastShown > 250) { lastShown = Date.now(); setDlActive({ key, loaded, total, title, podcast, manual }); }
         }
         const blob = new Blob(chunks, { type });
         const cache = await caches.open(OFFLINE_CACHE);
@@ -1201,9 +1214,13 @@ function App() {
         setDlIndex(readDl());
         if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
       } catch (e) {
-        console.warn("episode download failed:", e);
-        if (manual) alert("Download failed: " + e.message);
+        if (e.name !== "AbortError") {
+          console.warn("episode download failed:", e);
+          if (manual) alert("Download failed: " + e.message);
+        }
       }
+      dlAbortRef.current = null;
+      dlCurrentRef.current = null;
       setDlActive(null);
     }
     dlRunningRef.current = false;
@@ -1281,6 +1298,7 @@ function App() {
   }, [Object.keys(library.soundtracks).length]);
 
   function setAuto(id, n) {
+    cancelEpisodeDownloads((q) => q.pid === id && !q.manual); // changing the setting stops what it had queued or running
     try { localStorage.setItem("podauto:" + id, String(n)); } catch (e) {}
     writeEvicted(id, []); // a changed setting starts fresh
     setDlSettings((s) => ({ ...s }));
@@ -1473,11 +1491,11 @@ function App() {
     return results.length > 0 && results.every((r) => r);
   }
 
-  async function downloadSoundtrack(soundtrack, onProgress) {
+  async function downloadSoundtrack(soundtrack, onProgress, signal) {
     const cache = await caches.open(OFFLINE_CACHE);
     const keys = offlineKeys(soundtrack);
     for (let i = 0; i < keys.length; i++) {
-      const res = await fetch(streamUrl(keys[i]));
+      const res = await fetch(streamUrl(keys[i]), { signal });
       if (!res.ok) throw new Error("Download failed (" + res.status + ")");
       const type = res.headers.get("Content-Type") || "";
       const total = parseInt(res.headers.get("Content-Length") || "0", 10);
@@ -1525,7 +1543,6 @@ function App() {
   // ---- uploads ----
 
   const [uploadProgress, setUploadProgress] = useState(null);
-  const [downloadProgress, setDownloadProgress] = useState(null);
 
   function fileLabel(key) {
     return String(key).split("/").pop();
@@ -1542,7 +1559,7 @@ function App() {
   function overallPct(p) {
     if (p.batch) return p.total ? Math.min(100, (p.loaded / p.total) * 100) : 0;
     const frac = p.total ? Math.min(1, p.loaded / p.total) : 0;
-    return Math.min(100, ((p.index - 1 + frac) / p.count) * 100);
+    return Math.max(0, Math.min(100, ((p.index - 1 + frac) / p.count) * 100));
   }
 
   // single file upload via XHR so we get byte-level progress (fetch can't report upload progress)
@@ -1575,7 +1592,8 @@ function App() {
     try {
       for (let i = 0; i < list.length; i++) {
         const f = list[i];
-        const info = { batch: true, index: i + 1, count: list.length, name: f.name, total, label: "Uploading" };
+        const stName = library.soundtracks[id] ? library.soundtracks[id].name : "";
+        const info = { batch: true, index: i + 1, count: list.length, name: f.name, total, text: "Uploading" + (stName ? " to \"" + stName + "\"" : "") + " " + (i + 1) + "/" + list.length + ": " + f.name };
         setUploadProgress({ ...info, loaded: base });
         await uploadFile(id, f, (l) => setUploadProgress({ ...info, loaded: base + l }));
         base += f.size;
@@ -1587,15 +1605,17 @@ function App() {
 
   function renderTransfer(kind, p) {
     const pct = Math.round(overallPct(p));
+    const text = p.text || (kind + " " + p.index + "/" + p.count + ": " + p.name);
     const detail = p.batch
       ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total)
       : (p.total ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total) : fmtBytes(p.loaded));
     return (
       <div className="transfer-row" key={kind}>
-        <div className="transfer-label">{kind} {p.index}/{p.count}: {p.name}</div>
+        <div className="transfer-label" title={text}>{text}</div>
         <div className="transfer-track"><div className="transfer-fill" style={{ width: pct + "%" }}></div></div>
-        <div className="transfer-pct">{pct}%</div>
+        <div className="transfer-pct">{p.total ? pct + "%" : "..."}</div>
         <div className="transfer-detail">{detail}</div>
+        {p.onCancel && <button className="transfer-cancel" onClick={p.onCancel}>{p.cancelLabel || "Cancel"}</button>}
       </div>
     );
   }
@@ -2556,25 +2576,57 @@ function App() {
       setIsViewingDownloaded(false);
     }
     return () => { cancelled = true; };
-  }, [viewingId, viewingSoundtrackForEffect]);
+  }, [viewingId, viewingSoundtrackForEffect, dlTick]);
 
-  async function handleDownload() {
+  // ---- soundtrack downloads: one queue, one soundtrack at a time, each cancellable ----
+  const [sdlActive, setSdlActive] = useState(null); // { id, name, index, count, file, loaded, total }
+  const [sdlQueued, setSdlQueued] = useState([]); // soundtrack ids waiting
+  const [dlTick, setDlTick] = useState(0);
+  const sdlQueueRef = useRef([]);
+  const sdlRunningRef = useRef(false);
+  const sdlAbortRef = useRef(null);
+  const sdlCurrentRef = useRef(null);
+
+  function handleDownload() {
     if (!viewingSoundtrackForEffect) return;
-    const st = viewingSoundtrackForEffect;
-    setDownloadStatus("Starting...");
-    setDownloadProgress({ index: 0, count: offlineKeys(st).length, name: st.name, loaded: 0, total: 0, label: st.name });
-    try {
-      await downloadSoundtrack(st, (p) => {
-        setDownloadProgress({ ...p, name: fileLabel(p.name), label: st.name });
-        setDownloadStatus(Math.round(overallPct(p)) + "%");
-      });
-      setIsViewingDownloaded(true);
-    } catch (e) {
-      alert("Download failed: " + e.message);
-    } finally {
-      setDownloadStatus(null);
-      setDownloadProgress(null);
+    const id = viewingSoundtrackForEffect.id;
+    if (sdlCurrentRef.current === id || sdlQueueRef.current.includes(id)) return;
+    sdlQueueRef.current.push(id);
+    setSdlQueued([...sdlQueueRef.current]);
+    runSdlQueue();
+  }
+
+  async function runSdlQueue() {
+    if (sdlRunningRef.current) return;
+    sdlRunningRef.current = true;
+    while (sdlQueueRef.current.length) {
+      const id = sdlQueueRef.current.shift();
+      setSdlQueued([...sdlQueueRef.current]);
+      const st = library.soundtracks[id];
+      if (!st) continue;
+      const controller = new AbortController();
+      sdlAbortRef.current = controller;
+      sdlCurrentRef.current = id;
+      setSdlActive({ id, name: st.name, index: 0, count: offlineKeys(st).length, file: "", loaded: 0, total: 0 });
+      try {
+        await downloadSoundtrack(st, (p) => setSdlActive({ id, name: st.name, index: p.index, count: p.count, file: fileLabel(p.name), loaded: p.loaded, total: p.total }), controller.signal);
+      } catch (e) {
+        if (e.name === "AbortError") await removeDownload(st); // cancelled: don't leave a half-downloaded soundtrack behind
+        else alert("Download of \"" + st.name + "\" failed: " + e.message);
+      }
+      sdlCurrentRef.current = null;
+      sdlAbortRef.current = null;
+      setSdlActive(null);
+      setDlTick((t) => t + 1);
     }
+    sdlRunningRef.current = false;
+  }
+
+  // one soundtrack (queued or running), or everything when no id is given
+  function cancelSoundtrackDownloads(id) {
+    sdlQueueRef.current = id ? sdlQueueRef.current.filter((x) => x !== id) : [];
+    setSdlQueued([...sdlQueueRef.current]);
+    if (sdlAbortRef.current && (!id || sdlCurrentRef.current === id)) sdlAbortRef.current.abort();
   }
 
   async function handleRemoveDownload() {
@@ -2871,8 +2923,12 @@ function App() {
                   onChange={(e) => handleAddTracksToViewing(e.target.files)} />
               </label>
               {" "}
-              {downloadStatus ? (
-                <span className="add-tracks-btn">Downloading {downloadStatus}...</span>
+              {sdlActive && sdlActive.id === viewingId ? (
+                <button className="add-tracks-btn" onClick={() => cancelSoundtrackDownloads(viewingId)} title="Cancel this download">
+                  Downloading {sdlActive.total || sdlActive.index > 1 ? Math.round(overallPct(sdlActive)) + "%" : "..."} (cancel)
+                </button>
+              ) : sdlQueued.includes(viewingId) ? (
+                <button className="add-tracks-btn" onClick={() => cancelSoundtrackDownloads(viewingId)} title="Remove from the queue">Queued (cancel)</button>
               ) : isViewingDownloaded ? (
                 <button className="add-tracks-btn" onClick={handleRemoveDownload}>✓ Downloaded (remove)</button>
               ) : (
@@ -3050,6 +3106,7 @@ function App() {
                           onClick={(ev) => {
                             ev.stopPropagation();
                             if (saved) { if (window.confirm("Remove this download?")) removeEpisodeDownload(track.key); }
+                            else if (active || dlQueued.includes(track.key)) cancelEpisodeDownloads((q) => q.key === track.key);
                             else downloadEpisode(track.key, track.name, true, viewingId);
                           }}
                         >
@@ -3073,10 +3130,19 @@ function App() {
         <div className={"sync-badge" + (syncStatus === "Offline" ? " offline" : "")}>{syncStatus}</div>
       )}
 
-      {(uploadProgress || downloadProgress) && (
+      {(uploadProgress || sdlActive || dlActive) && (
         <div className="transfer-wrap">
           {uploadProgress && renderTransfer("Uploading", uploadProgress)}
-          {downloadProgress && renderTransfer("Downloading", downloadProgress)}
+          {sdlActive && renderTransfer("Download", {
+            index: sdlActive.index, count: sdlActive.count, loaded: sdlActive.loaded, total: sdlActive.total,
+            text: "Downloading \"" + sdlActive.name + "\" " + sdlActive.index + "/" + sdlActive.count + (sdlActive.file ? ": " + sdlActive.file : "") + (sdlQueued.length > 0 ? " (+" + sdlQueued.length + " queued)" : ""),
+            onCancel: () => cancelSoundtrackDownloads(null), cancelLabel: sdlQueued.length > 0 ? "Cancel all" : "Cancel",
+          })}
+          {dlActive && renderTransfer("Episode", {
+            batch: true, loaded: dlActive.loaded, total: dlActive.total,
+            text: (dlActive.manual ? "Downloading" : "Auto-downloading") + " episode: " + (dlActive.podcast ? dlActive.podcast + " - " : "") + (dlActive.title || "") + (dlQueued.length > 0 ? " (+" + dlQueued.length + " queued)" : ""),
+            onCancel: () => cancelEpisodeDownloads(() => true), cancelLabel: dlQueued.length > 0 ? "Cancel all" : "Cancel",
+          })}
         </div>
       )}
 
