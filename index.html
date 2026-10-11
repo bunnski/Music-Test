@@ -1568,7 +1568,7 @@ function App() {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", WORKER_URL + "/api/upload?id=" + encodeURIComponent(id));
       xhr.setRequestHeader("X-Auth-Token", token);
-      xhr.setRequestHeader("X-Filename", file.name);
+      xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
       xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
       if (onBytes) xhr.upload.onprogress = (e) => onBytes(e.loaded);
       xhr.onload = () => {

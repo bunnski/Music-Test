@@ -522,7 +522,9 @@ export default {
     // Works for soundtracks (tracks + cover) and playlists (cover image only).
     if (path === "/api/upload" && request.method === "POST") {
       const id = url.searchParams.get("id");
-      const filename = request.headers.get("X-Filename");
+      const rawFilename = request.headers.get("X-Filename");
+      let filename = rawFilename;
+      try { filename = rawFilename ? decodeURIComponent(rawFilename) : rawFilename; } catch (e) {}
       if (!id || !filename) return new Response("Missing id or filename", { status: 400, headers: corsHeaders });
 
       const library = await getLibrary(env);
