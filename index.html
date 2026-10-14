@@ -864,6 +864,144 @@ function parsePodcastFeed(xmlText) {
 // Tracks inside a soundtrack are either owned { key, name } or references { key, soundtrackId } to a track owned by
 // another soundtrack. This fills in names for references (flagged isRef) so the rest of the app can treat every
 // soundtrack's tracks the same way. References whose source no longer exists are dropped.
+// ---- embedded cover art in audio files: ID3 (mp3), PICTURE block (flac), covr atom (m4a/mp4) ----
+// read(start, length) returns a Uint8Array for that byte range (shorter or empty past the end of the file)
+function u32(b, o) { return ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0; }
+function syncsafe(b, o) { return (b[o] << 21) | (b[o + 1] << 14) | (b[o + 2] << 7) | b[o + 3]; }
+function ascii(b, o, n) { let s = ""; for (let i = o; i < o + n && i < b.length; i++) s += String.fromCharCode(b[i]); return s; }
+
+function makeArt(bytes) {
+  let mime = null;
+  if (bytes.length > 3 && bytes[0] === 0xFF && bytes[1] === 0xD8) mime = "image/jpeg";
+  else if (bytes.length > 4 && bytes[0] === 0x89 && ascii(bytes, 1, 3) === "PNG") mime = "image/png";
+  else if (bytes.length > 12 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP") mime = "image/webp";
+  else if (bytes.length > 3 && ascii(bytes, 0, 3) === "GIF") mime = "image/gif";
+  return mime && bytes.length > 100 && bytes.length <= 8 * 1024 * 1024 ? { mime, bytes } : null;
+}
+
+async function artFromId3(read) {
+  const head = await read(0, 10);
+  if (head.length < 10 || ascii(head, 0, 3) !== "ID3") return null;
+  const ver = head[3];
+  const flags = head[5];
+  const size = syncsafe(head, 6);
+  if (size <= 0 || size > 20 * 1024 * 1024) return null;
+  const tag = await read(10, size);
+  let pos = 0;
+  if ((flags & 0x40) && tag.length >= 4) pos = ver === 4 ? syncsafe(tag, 0) : u32(tag, 0) + 4; // skip extended header
+  const idLen = ver === 2 ? 3 : 4;
+  const hdrLen = ver === 2 ? 6 : 10;
+  let best = null;
+  while (pos + hdrLen <= tag.length) {
+    const id = ascii(tag, pos, idLen);
+    if (!id.trim() || tag[pos] === 0) break; // padding
+    let fsize;
+    if (ver === 2) fsize = (tag[pos + 3] << 16) | (tag[pos + 4] << 8) | tag[pos + 5];
+    else if (ver === 4) fsize = syncsafe(tag, pos + 4);
+    else fsize = u32(tag, pos + 4);
+    const dStart = pos + hdrLen;
+    const dEnd = dStart + fsize;
+    if (fsize <= 0 || dEnd > tag.length) break;
+    if (id === "APIC" || id === "PIC") {
+      const f = tag.subarray(dStart, dEnd);
+      const enc = f[0];
+      let p = 1;
+      if (ver === 2) p += 3; // 3 letter image format
+      else { while (p < f.length && f[p] !== 0) p++; p++; } // mime type, null terminated
+      const picType = f[p];
+      p++;
+      if (enc === 1 || enc === 2) { while (p + 1 < f.length && !(f[p] === 0 && f[p + 1] === 0)) p += 2; p += 2; } // utf-16 description
+      else { while (p < f.length && f[p] !== 0) p++; p++; }
+      const art = makeArt(f.slice(p));
+      if (art && (!best || picType === 3)) { best = art; if (picType === 3) break; } // 3 = front cover
+    }
+    pos = dEnd;
+  }
+  return best;
+}
+
+async function artFromFlac(read) {
+  const head = await read(0, 4);
+  if (head.length < 4 || ascii(head, 0, 4) !== "fLaC") return null;
+  let pos = 4;
+  let best = null;
+  for (let n = 0; n < 200; n++) {
+    const h = await read(pos, 4);
+    if (h.length < 4) break;
+    const last = !!(h[0] & 0x80);
+    const type = h[0] & 0x7f;
+    const len = (h[1] << 16) | (h[2] << 8) | h[3];
+    if (type === 6 && len < 20 * 1024 * 1024) {
+      const b = await read(pos + 4, len);
+      if (b.length === len) {
+        const picType = u32(b, 0);
+        let p = 8 + u32(b, 4);
+        p += 4 + u32(b, p);
+        p += 16; // width, height, depth, colors
+        const dataLen = u32(b, p);
+        p += 4;
+        const art = makeArt(b.slice(p, p + dataLen));
+        if (art && (!best || picType === 3)) { best = art; if (picType === 3) break; }
+      }
+    }
+    if (last) break;
+    pos += 4 + len;
+  }
+  return best;
+}
+
+// finds a child box between start and end, reading only the small box headers
+async function findMp4Box(read, start, end, type) {
+  let pos = start;
+  while (pos + 8 <= end) {
+    const h = await read(pos, 16);
+    if (h.length < 8) return null;
+    let size = u32(h, 0);
+    let hl = 8;
+    const t = ascii(h, 4, 4);
+    if (size === 1) {
+      if (h.length < 16) return null;
+      size = u32(h, 8) * 4294967296 + u32(h, 12);
+      hl = 16;
+    } else if (size === 0) size = end - pos;
+    if (size < hl) return null;
+    if (t === type) return { start: pos + hl, end: Math.min(pos + size, end) };
+    pos += size;
+  }
+  return null;
+}
+
+async function artFromMp4(read) {
+  const head = await read(0, 12);
+  if (head.length < 12 || ascii(head, 4, 4) !== "ftyp") return null;
+  const moov = await findMp4Box(read, 0, Number.MAX_SAFE_INTEGER, "moov");
+  if (!moov) return null;
+  const udta = await findMp4Box(read, moov.start, moov.end, "udta");
+  if (!udta) return null;
+  const meta = await findMp4Box(read, udta.start, udta.end, "meta");
+  if (!meta) return null;
+  const ilst = await findMp4Box(read, meta.start + 4, meta.end, "ilst"); // meta is a full box: skip version and flags
+  if (!ilst) return null;
+  const covr = await findMp4Box(read, ilst.start, ilst.end, "covr");
+  if (!covr) return null;
+  const data = await findMp4Box(read, covr.start, covr.end, "data");
+  if (!data) return null;
+  return makeArt(await read(data.start + 8, Math.min(data.end - data.start - 8, 8 * 1024 * 1024 + 1))); // skip version, flags, locale
+}
+
+async function extractEmbeddedArt(read) {
+  const head = await read(0, 12);
+  if (head.length < 8) return null;
+  if (ascii(head, 0, 3) === "ID3") return artFromId3(read);
+  if (ascii(head, 0, 4) === "fLaC") return artFromFlac(read);
+  if (ascii(head, 4, 4) === "ftyp") return artFromMp4(read);
+  return null;
+}
+
+function makeFileReader(file) {
+  return async (start, length) => new Uint8Array(await file.slice(start, start + length).arrayBuffer());
+}
+
 function sideOf(t) { return t && t.side === "B" ? "B" : "A"; }
 
 function hydrateLibrary(lib) {
@@ -874,7 +1012,7 @@ function hydrateLibrary(lib) {
       if (!t.soundtrackId || t.soundtrackId === s.id) return t;
       const owner = src[t.soundtrackId];
       const real = owner && (owner.tracks || []).find((x) => x.key === t.key && !x.soundtrackId);
-      return real ? { key: t.key, name: real.name, soundtrackId: t.soundtrackId, isRef: true, side: t.side } : null;
+      return real ? { key: t.key, name: real.name, soundtrackId: t.soundtrackId, isRef: true, side: t.side, cover: real.cover } : null;
     }).filter(Boolean);
     // with A/B sides on, every A track is listed before every B track
     const ordered = s.sides ? [...tracks.filter((t) => sideOf(t) === "A"), ...tracks.filter((t) => sideOf(t) === "B")] : tracks;
@@ -1575,7 +1713,105 @@ function App() {
   }
 
   // single file upload via XHR so we get byte-level progress (fetch can't report upload progress)
-  function uploadFile(id, file, onBytes) {
+  async function uploadFile(id, file, onBytes) {
+    await uploadFileRaw(id, file, onBytes);
+    // audio files: if the file carries its own picture, keep it as that track's icon (never blocks the upload)
+    if (!/\.(jpe?g|png|webp|gif)$/i.test(file.name)) {
+      try {
+        const art = await extractEmbeddedArt(makeFileReader(file));
+        if (art) await postTrackCover(id, "media/" + id + "/" + file.name, art);
+      } catch (e) { console.warn("track art skipped", e); }
+    }
+  }
+
+  async function postTrackCover(id, key, art) {
+    const res = await fetch(WORKER_URL + "/api/upload-track-cover?id=" + encodeURIComponent(id) + "&key=" + encodeURIComponent(key), {
+      method: "POST",
+      headers: { "X-Auth-Token": token, "Content-Type": art.mime },
+      body: art.bytes,
+    });
+    if (!res.ok) throw new Error("track cover upload failed (" + res.status + ")");
+  }
+
+  // reads byte ranges of a stored track through the Worker (needs the Range support in worker.js)
+  function makeRangeReader(key) {
+    return async (start, length) => {
+      if (length <= 0) return new Uint8Array(0);
+      const res = await fetch(streamUrl(key), { headers: { Range: "bytes=" + start + "-" + (start + length - 1) } });
+      if (res.status === 416) return new Uint8Array(0);
+      if (!res.ok) throw new Error("read failed (" + res.status + ")");
+      const buf = new Uint8Array(await res.arrayBuffer());
+      return res.status === 206 ? buf : buf.slice(start, start + length); // a Worker without Range support sends the whole file
+    };
+  }
+
+  // looks inside the already uploaded tracks of a soundtrack for embedded pictures
+  async function scanTrackArt(id) {
+    const st = library.soundtracks[id];
+    if (!st) return;
+    const todo = st.tracks.filter((t) => !t.isRef && !t.cover && !t.coverOff && !isExternal(t.key));
+    if (!todo.length) { alert("Nothing to scan: every track here already has its own art, or there are no tracks."); return; }
+    if (!confirm("Scan " + todo.length + " track(s) in \"" + st.name + "\" for embedded art? This only reads the start of each file.")) return;
+    let found = 0;
+    try {
+      for (let i = 0; i < todo.length; i++) {
+        setUploadProgress({ batch: true, unit: "items", index: i + 1, count: todo.length, name: todo[i].name, total: todo.length, loaded: i, text: "Scanning track art " + (i + 1) + "/" + todo.length + ": " + todo[i].name });
+        try {
+          const art = await extractEmbeddedArt(makeRangeReader(todo[i].key));
+          if (art) { await postTrackCover(id, todo[i].key, art); found++; }
+        } catch (e) { console.warn("track art scan failed for", todo[i].key, e); }
+      }
+    } finally {
+      setUploadProgress(null);
+    }
+    await loadLibrary();
+    alert("Found art for " + found + " of " + todo.length + " track(s).");
+  }
+
+  // looks inside one track's file for an embedded picture; id is the soundtrack that owns the file
+  async function findTrackArt(id, key) {
+    const st = library.soundtracks[id];
+    const t = st && st.tracks.find((x) => x.key === key);
+    if (!t) return;
+    let found = false;
+    let failed = false;
+    try {
+      setUploadProgress({ batch: true, unit: "items", index: 1, count: 1, name: t.name, total: 1, loaded: 0, text: "Looking for track art: " + stripExt(t.name) });
+      const art = await extractEmbeddedArt(makeRangeReader(key));
+      if (art) { await postTrackCover(id, key, art); found = true; }
+    } catch (e) {
+      console.warn("track art lookup failed for", key, e);
+      failed = true;
+    } finally {
+      setUploadProgress(null);
+    }
+    if (found) await loadLibrary();
+    else alert(failed ? "Could not read this file." : "No embedded picture found in this file.");
+  }
+
+  // back to the soundtrack image for this track (id is the soundtrack that owns the file)
+  async function handleClearTrackCover(id, key) {
+    // plain fetch: a failure here should show its own message, not sign you out
+    try {
+      const res = await fetch(WORKER_URL + "/api/clear-track-cover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Auth-Token": token },
+        body: JSON.stringify({ id, key }),
+      });
+      if (!res.ok) {
+        alert(res.status === 404
+          ? "The Worker does not know this action yet (or the track was not found). Deploy the latest worker.js with wrangler deploy, then try again."
+          : "Could not switch the image (error " + res.status + ").");
+        return;
+      }
+    } catch (e) {
+      alert("Could not reach the server.");
+      return;
+    }
+    loadLibrary();
+  }
+
+  function uploadFileRaw(id, file, onBytes) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", WORKER_URL + "/api/upload?id=" + encodeURIComponent(id));
@@ -1619,7 +1855,7 @@ function App() {
     const pct = Math.round(overallPct(p));
     const text = p.text || (kind + " " + p.index + "/" + p.count + ": " + p.name);
     const detail = p.batch
-      ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total)
+      ? (p.unit === "items" ? p.loaded + " / " + p.total : fmtBytes(p.loaded) + " / " + fmtBytes(p.total))
       : (p.total ? fmtBytes(p.loaded) + " / " + fmtBytes(p.total) : fmtBytes(p.loaded));
     return (
       <div className="transfer-row" key={kind}>
@@ -3147,7 +3383,7 @@ function App() {
         <div className="now-playing-info">
           {hasNowPlaying ? (
             <React.Fragment>
-              {playingSoundtrack.cover && <img className="now-playing-cover" style={{cursor: "pointer"}} title="Go to now playing" onClick={goToNowPlaying} src={streamUrl(playingSoundtrack.cover)} />}
+              {(() => { const npCover = (playingTrack && playingTrack.cover) || playingSoundtrack.cover; return npCover && <img className="now-playing-cover" style={{cursor: "pointer"}} title="Go to now playing" onClick={goToNowPlaying} src={streamUrl(npCover)} />; })()}
               <div style={{minWidth: 0}}>
                 <Marquee text={playingTrack ? stripExt(playingTrack.name) : ""} className="now-playing-track" />
                 <Marquee text={playingSoundtrack.name} className="now-playing-folder" />
@@ -3486,6 +3722,9 @@ function App() {
                     </div>
                   )}
                   <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
+                  {!(library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].feedUrl) && (
+                    <div className="context-item" onClick={() => { const sid = contextMenu.target.id; setContextMenu(null); scanTrackArt(sid); }}>Find track art in files</div>
+                  )}
                   {library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].parentId && (
                     <div className="context-item" onClick={() => moveItem("soundtrack", contextMenu.target.id, null)}>Move to top level</div>
                   )}
@@ -3520,6 +3759,10 @@ function App() {
                       <div className="context-item" onClick={() => setAddPickerFor({ id: contextMenu.target.id, key: contextMenu.target.key, ownerId })}>
                         Add to soundtrack...
                       </div>
+                      <div className="context-item" onClick={() => { const k = contextMenu.target.key; setContextMenu(null); findTrackArt(ownerId, k); }}>Find track image</div>
+                      {menuTrack && menuTrack.cover && (
+                        <div className="context-item" onClick={() => { const k = contextMenu.target.key; setContextMenu(null); handleClearTrackCover(ownerId, k); }}>Use soundtrack image</div>
+                      )}
                       <div className="context-item danger" onClick={() => handleDeleteTrack(contextMenu.target.id, contextMenu.target.key)}>
                         {isRef ? "Remove from this soundtrack" : "Delete"}
                       </div>

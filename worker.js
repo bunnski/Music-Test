@@ -126,7 +126,8 @@ export default {
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, X-Auth-Token, X-Filename",
+      "Access-Control-Allow-Headers": "Content-Type, X-Auth-Token, X-Filename, Range",
+      "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
     };
 
     if (request.method === "OPTIONS") {
@@ -531,8 +532,9 @@ export default {
         // just a reference: unlink it, the file stays with its owner
         library.soundtracks[id].tracks = library.soundtracks[id].tracks.filter((t) => t.key !== key);
       } else {
-        // owned: delete the file and drop every reference to it
+        // owned: delete the file (and its own cover art) and drop every reference to it
         await env.MUSIC_BUCKET.delete(key);
+        if (entry && entry.cover) await env.MUSIC_BUCKET.delete(entry.cover);
         for (const s of Object.values(library.soundtracks)) {
           s.tracks = (s.tracks || []).filter((t) => t.key !== key);
         }
@@ -592,6 +594,46 @@ export default {
       }
       await saveLibrary(env, library);
       return json({ success: true, key });
+    }
+
+    // POST /api/upload-track-cover?id=<soundtrackId>&key=<trackKey> -> body is the raw image (art found inside the audio file).
+    // Stored at media/<id>/.track-covers/<file>.<ext> and linked to the track as track.cover. Only for tracks the soundtrack owns.
+    if (path === "/api/upload-track-cover" && request.method === "POST") {
+      const id = url.searchParams.get("id");
+      const key = url.searchParams.get("key");
+      if (!id || !key) return new Response("Missing id or key", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      const target = library.soundtracks[id];
+      const track = target && target.tracks.find((t) => t.key === key && !t.soundtrackId);
+      if (!track) return new Response("Unknown track", { status: 404, headers: corsHeaders });
+
+      const contentType = request.headers.get("Content-Type") || "image/jpeg";
+      const ext = /png/i.test(contentType) ? "png" : /webp/i.test(contentType) ? "webp" : /gif/i.test(contentType) ? "gif" : "jpg";
+      const coverKey = `media/${id}/.track-covers/${key.split("/").pop()}.${ext}`;
+      const body = await request.arrayBuffer();
+      if (!body.byteLength || body.byteLength > 8 * 1024 * 1024) return new Response("Bad image size", { status: 400, headers: corsHeaders });
+      if (track.cover && track.cover !== coverKey) await env.MUSIC_BUCKET.delete(track.cover);
+      await env.MUSIC_BUCKET.put(coverKey, body, { httpMetadata: { contentType } });
+      track.cover = coverKey;
+      delete track.coverOff;
+      await saveLibrary(env, library);
+      return json({ success: true, cover: coverKey });
+    }
+
+    // POST /api/clear-track-cover { id, key } -> drops the track's own art so it shows the soundtrack cover again.
+    // coverOff remembers the choice so "Find track art in files" doesn't bring it back.
+    if (path === "/api/clear-track-cover" && request.method === "POST") {
+      const { id, key } = await request.json();
+      if (!id || !key) return new Response("Missing id or key", { status: 400, headers: corsHeaders });
+      const library = await getLibrary(env);
+      const target = library.soundtracks[id];
+      const track = target && target.tracks.find((t) => t.key === key && !t.soundtrackId);
+      if (!track) return new Response("Unknown track", { status: 404, headers: corsHeaders });
+      if (track.cover) await env.MUSIC_BUCKET.delete(track.cover);
+      delete track.cover;
+      track.coverOff = true;
+      await saveLibrary(env, library);
+      return json({ success: true });
     }
 
     // ---- track references (put a track from one soundtrack into another without copying the file) ----
