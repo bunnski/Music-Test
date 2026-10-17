@@ -998,6 +998,50 @@ async function extractEmbeddedArt(read) {
   return null;
 }
 
+// Scales picture bytes down to a small JPEG (longest side maxDim). If the browser cannot decode or encode it, or the result
+// would not be smaller, the original is returned unchanged. Same input always gives the same output, so identical pictures
+// still match each other afterwards.
+async function shrinkImage(art, maxDim, quality) {
+  maxDim = maxDim || 320;
+  quality = quality || 0.8;
+  try {
+    const blob = new Blob([art.bytes], { type: art.mime });
+    let bmp;
+    if (typeof createImageBitmap === "function") {
+      bmp = await createImageBitmap(blob);
+    } else {
+      const url = URL.createObjectURL(blob);
+      try {
+        bmp = await new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = url;
+        });
+      } finally { URL.revokeObjectURL(url); }
+    }
+    const w0 = bmp.width, h0 = bmp.height;
+    if (!w0 || !h0) return art;
+    const scale = Math.min(1, maxDim / Math.max(w0, h0));
+    const w = Math.max(1, Math.round(w0 * scale));
+    const h = Math.max(1, Math.round(h0 * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#111"; // transparent areas would turn black in a JPEG anyway; make that deliberate
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bmp, 0, 0, w, h);
+    if (bmp.close) bmp.close();
+    const out = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+    if (!out) return art;
+    const bytes = new Uint8Array(await out.arrayBuffer());
+    return bytes.length > 100 && bytes.length < art.bytes.length ? { mime: "image/jpeg", bytes } : art;
+  } catch (e) {
+    return art;
+  }
+}
+
 function makeFileReader(file) {
   return async (start, length) => new Uint8Array(await file.slice(start, start + length).arrayBuffer());
 }
@@ -1724,8 +1768,12 @@ function App() {
     }
   }
 
-  async function postTrackCover(id, key, art) {
-    const res = await fetch(WORKER_URL + "/api/upload-track-cover?id=" + encodeURIComponent(id) + "&key=" + encodeURIComponent(key), {
+  // force = shrink even if this soundtrack has auto-shrink switched off (used by the explicit "Shrink track art" action)
+  async function postTrackCover(id, key, art, force) {
+    const st = library.soundtracks[id];
+    const doShrink = !!force || !st || st.shrinkArt !== false;
+    if (doShrink) art = await shrinkImage(art); // small file = small download; the original stays inside the audio file
+    const res = await fetch(WORKER_URL + "/api/upload-track-cover?id=" + encodeURIComponent(id) + "&key=" + encodeURIComponent(key) + (doShrink ? "" : "&full=1"), {
       method: "POST",
       headers: { "X-Auth-Token": token, "Content-Type": art.mime },
       body: art.bytes,
@@ -1766,6 +1814,43 @@ function App() {
     }
     await loadLibrary();
     alert("Found art for " + found + " of " + todo.length + " track(s).");
+  }
+
+  // re-saves existing track art small and shared (same picture = one file). ids: list of soundtrack ids, or null for all.
+  // Art already stored small under a hashed name is skipped. Soundtrack covers are not touched.
+  async function shrinkTrackArt(ids) {
+    // "all" leaves out soundtracks that have auto-shrink switched off; picking one soundtrack shrinks it regardless
+    const sts = (ids ? ids.map((i) => library.soundtracks[i]) : Object.values(library.soundtracks).filter((st) => st.shrinkArt !== false)).filter(Boolean);
+    const hashed = /\/\.track-covers\/[0-9a-f]{16}\.[a-z]+$/;
+    const todo = [];
+    sts.forEach((st) => st.tracks.forEach((t) => {
+      if (!t.isRef && t.cover && (!hashed.test(t.cover) || t.coverFull)) todo.push({ id: st.id, t });
+    }));
+    if (!todo.length) { alert("Nothing to do: the track art here is already small and shared."); return; }
+    if (!confirm("Shrink the art of " + todo.length + " track(s)? Audio files and soundtrack covers are not changed, and the full-size picture stays inside each audio file.")) return;
+    let done = 0;
+    let failed = 0;
+    try {
+      for (let i = 0; i < todo.length; i++) {
+        const item = todo[i];
+        setUploadProgress({ batch: true, unit: "items", index: i + 1, count: todo.length, name: item.t.name, total: todo.length, loaded: i, text: "Shrinking track art " + (i + 1) + "/" + todo.length + ": " + stripExt(item.t.name) });
+        try {
+          const res = await fetch(streamUrl(item.t.cover));
+          if (!res.ok) throw new Error("download failed (" + res.status + ")");
+          const art = makeArt(new Uint8Array(await res.arrayBuffer()));
+          if (!art) throw new Error("not an image");
+          await postTrackCover(item.id, item.t.key, art, true);
+          done++;
+        } catch (e) {
+          failed++;
+          console.warn("shrink failed for", item.t.key, e);
+        }
+      }
+    } finally {
+      setUploadProgress(null);
+    }
+    await loadLibrary();
+    alert("Done: " + done + " of " + todo.length + " track(s)" + (failed ? ", " + failed + " could not be processed (see the console)." : "."));
   }
 
   // looks inside one track's file for an embedded picture; id is the soundtrack that owns the file
@@ -2252,6 +2337,7 @@ function App() {
       year: obj.year || "",
       description: obj.description || "",
       sides: !!obj.sides,
+      shrinkArt: obj.shrinkArt !== false,
     });
     setEditCoverFile(null);
     setShowEditModal(true);
@@ -2269,6 +2355,7 @@ function App() {
         artist: editForm.artist,
         year: editForm.year,
         sides: !!editForm.sides,
+        shrinkArt: !!editForm.shrinkArt,
       };
       await authedFetch("/api/update-metadata", {
         method: "POST",
@@ -2533,7 +2620,7 @@ function App() {
           onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: item.id })}
         >
           <span className="drag-handle">⠿</span>
-          <img className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
+          <img loading="lazy" decoding="async" className="folder-thumb" src={item.cover ? streamUrl(item.cover) : ""} />
           <span className="folder-name">{item.name}</span>
           {excludedIds.includes(item.id) && !item.feedUrl && <span className="folder-flag">no random</span>}
           {item.id === playingId && <div className="folder-playing-dot"></div>}
@@ -3028,7 +3115,7 @@ function App() {
                       onClick={() => openSoundtrack(s.id)}
                       onContextMenu={(e) => openContextMenu(e, { type: "soundtrack", id: s.id })}
                     >
-                      <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
+                      <img loading="lazy" decoding="async" className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
                       <span className="folder-name">{s.name}</span>
                       {s.id === playingId && <div className="folder-playing-dot"></div>}
                       <RowMenuBtn />
@@ -3042,7 +3129,7 @@ function App() {
                     className="folder-item"
                     onClick={() => { openSoundtrack(s.id); playTrackAt(s.id, r.track.key); }}
                   >
-                    <img className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
+                    <img loading="lazy" decoding="async" className="folder-thumb" src={s.cover ? streamUrl(s.cover) : ""} />
                     <div style={{ minWidth: 0, overflow: "hidden" }}>
                       <div className="folder-name">{stripExt(r.track.name)}</div>
                       <div className="search-subtitle">{s.name}</div>
@@ -3090,7 +3177,7 @@ function App() {
                         onClick={() => openSoundtrack(p.id)}
                       >
                         <span className="drag-handle">⠿</span>
-                        <img className="folder-thumb" src={p.cover ? streamUrl(p.cover) : ""} />
+                        <img loading="lazy" decoding="async" className="folder-thumb" src={p.cover ? streamUrl(p.cover) : ""} />
                         <span className="folder-name">{p.name}</span>
                         {excludedIds.includes(p.id) && <span className="folder-flag">no random</span>}
                         {p.type === "soundtrack" && p.id === playingId && <div className="folder-playing-dot"></div>}
@@ -3302,6 +3389,8 @@ function App() {
                   >
                     <span className="drag-handle">⠿</span>
                     <img
+                      loading="lazy"
+                      decoding="async"
                       className="track-thumb"
                       src={(() => {
                         const own = track.isRef ? library.soundtracks[track.soundtrackId] : viewingSoundtrack;
@@ -3639,6 +3728,13 @@ function App() {
               </label>
             )}
 
+            {!(library.soundtracks[editTarget.id] && library.soundtracks[editTarget.id].feedUrl) && (
+              <label style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 12, fontSize: 14}}>
+                <input type="checkbox" checked={!!editForm.shrinkArt} onChange={(e) => setEditForm({ ...editForm, shrinkArt: e.target.checked })} />
+                <span>Auto-shrink track art when added (smaller downloads)</span>
+              </label>
+            )}
+
             <div style={{marginBottom: 12}}>
               <label style={{fontSize: 12, color: "var(--text-dim)", display: "block", marginBottom: 4}}>Cover image</label>
               <input type="file" accept="image/*" onChange={(e) => setEditCoverFile(e.target.files[0])} />
@@ -3687,6 +3783,7 @@ function App() {
                 <React.Fragment>
                   <div className="context-item" onClick={() => handleCreateFolder(null)}>New folder</div>
                   <div className="context-item" onClick={() => handleCreateEmptySoundtrack(null)}>New empty soundtrack</div>
+                  <div className="context-item" onClick={() => { setContextMenu(null); shrinkTrackArt(null); }}>Shrink all track art</div>
                   <div className="context-item" onClick={() => openPodcastModal(null)}>Add podcast...</div>
                 </React.Fragment>
               )}
@@ -3724,6 +3821,9 @@ function App() {
                   <div className="context-item" onClick={() => handleRenameSoundtrack(contextMenu.target.id)}>Rename</div>
                   {!(library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].feedUrl) && (
                     <div className="context-item" onClick={() => { const sid = contextMenu.target.id; setContextMenu(null); scanTrackArt(sid); }}>Find track art in files</div>
+                  )}
+                  {!(library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].feedUrl) && (
+                    <div className="context-item" onClick={() => { const sid = contextMenu.target.id; setContextMenu(null); shrinkTrackArt([sid]); }}>Shrink track art</div>
                   )}
                   {library.soundtracks[contextMenu.target.id] && library.soundtracks[contextMenu.target.id].parentId && (
                     <div className="context-item" onClick={() => moveItem("soundtrack", contextMenu.target.id, null)}>Move to top level</div>

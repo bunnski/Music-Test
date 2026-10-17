@@ -12,6 +12,9 @@
 //   (file lives at media/<thisId>/...) or REFERENCED { key, soundtrackId } (file lives in another
 //   soundtrack, name is looked up from that owner). Old playlists are migrated into soundtracks
 //   automatically the first time the library is loaded (a backup is saved first).
+// - Track art (pictures taken from inside audio files) is stored once per distinct picture at
+//   media/<soundtrackId>/.track-covers/<hash>.<ext> and shared by every track that uses it. Such files never
+//   change, so they are served with a long browser cache; other images are re-checked cheaply (ETag / 304).
 
 const LIBRARY_KEY = "_library.json";
 const PROGRESS_KEY = "_progress.json";
@@ -45,6 +48,16 @@ async function getIgdbToken(env) {
   const expires_at = Date.now() + (tokenData.expires_in - 300) * 1000; // refresh 5 min early
   await env.MUSIC_BUCKET.put("_igdb_token.json", JSON.stringify({ access_token: tokenData.access_token, expires_at }));
   return tokenData.access_token;
+}
+
+// Track art is stored once per distinct picture (named by a hash of its bytes) and shared by every track that uses it.
+// So a cover file may only be deleted when no track points at it any more.
+async function deleteCoverIfUnused(env, library, coverKey) {
+  if (!coverKey) return;
+  for (const st of Object.values(library.soundtracks)) {
+    if ((st.tracks || []).some((t) => t.cover === coverKey)) return;
+  }
+  await env.MUSIC_BUCKET.delete(coverKey);
 }
 
 // Soundtracks with sides on (sides: true) keep every "A" track (side missing or "A") before every "B" track.
@@ -331,10 +344,10 @@ export default {
       return json({ success: true });
     }
 
-    // POST /api/update-metadata { id, name, artist, year, description, sides }
+    // POST /api/update-metadata { id, name, artist, year, description, sides, shrinkArt }
     // merges any provided fields onto the soundtrack.
     if (path === "/api/update-metadata" && request.method === "POST") {
-      const { id, name, artist, year, description, sides } = await request.json();
+      const { id, name, artist, year, description, sides, shrinkArt } = await request.json();
       if (!id) return new Response("Missing id", { status: 400, headers: corsHeaders });
       const library = await getLibrary(env);
       const target = library.soundtracks[id];
@@ -344,6 +357,11 @@ export default {
       if (description !== undefined) target.description = description;
       if (artist !== undefined) target.artist = artist;
       if (year !== undefined) target.year = year;
+      // shrinkArt: new track art is saved small unless this is switched off (stored only when off, so the default is on)
+      if (shrinkArt !== undefined) {
+        if (shrinkArt) delete target.shrinkArt;
+        else target.shrinkArt = false;
+      }
       if (sides !== undefined) {
         target.sides = !!sides;
         if (target.sides) target.tracks = partitionSides(target.tracks || []);
@@ -534,12 +552,12 @@ export default {
       } else {
         // owned: delete the file (and its own cover art) and drop every reference to it
         await env.MUSIC_BUCKET.delete(key);
-        if (entry && entry.cover) await env.MUSIC_BUCKET.delete(entry.cover);
         for (const s of Object.values(library.soundtracks)) {
           s.tracks = (s.tracks || []).filter((t) => t.key !== key);
         }
       }
       await saveLibrary(env, library);
+      if (entry && entry.cover && !entry.soundtrackId) await deleteCoverIfUnused(env, library, entry.cover);
       return json({ success: true });
     }
 
@@ -597,7 +615,8 @@ export default {
     }
 
     // POST /api/upload-track-cover?id=<soundtrackId>&key=<trackKey> -> body is the raw image (art found inside the audio file).
-    // Stored at media/<id>/.track-covers/<file>.<ext> and linked to the track as track.cover. Only for tracks the soundtrack owns.
+    // Stored at media/<id>/.track-covers/<hash>.<ext> (same picture = same file, shared by tracks) and linked as track.cover.
+    // Only for tracks the soundtrack owns.
     if (path === "/api/upload-track-cover" && request.method === "POST") {
       const id = url.searchParams.get("id");
       const key = url.searchParams.get("key");
@@ -609,14 +628,22 @@ export default {
 
       const contentType = request.headers.get("Content-Type") || "image/jpeg";
       const ext = /png/i.test(contentType) ? "png" : /webp/i.test(contentType) ? "webp" : /gif/i.test(contentType) ? "gif" : "jpg";
-      const coverKey = `media/${id}/.track-covers/${key.split("/").pop()}.${ext}`;
       const body = await request.arrayBuffer();
       if (!body.byteLength || body.byteLength > 8 * 1024 * 1024) return new Response("Bad image size", { status: 400, headers: corsHeaders });
-      if (track.cover && track.cover !== coverKey) await env.MUSIC_BUCKET.delete(track.cover);
-      await env.MUSIC_BUCKET.put(coverKey, body, { httpMetadata: { contentType } });
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+      const hash = Array.from(digest.slice(0, 8)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      const coverKey = `media/${id}/.track-covers/${hash}.${ext}`;
+      const oldCover = track.cover;
+      if (!(await env.MUSIC_BUCKET.head(coverKey))) {
+        await env.MUSIC_BUCKET.put(coverKey, body, { httpMetadata: { contentType } });
+      }
       track.cover = coverKey;
       delete track.coverOff;
+      // full=1 means the picture was saved at its original size on purpose, so a later "Shrink track art" should still process it
+      if (url.searchParams.get("full") === "1") track.coverFull = true;
+      else delete track.coverFull;
       await saveLibrary(env, library);
+      if (oldCover && oldCover !== coverKey) await deleteCoverIfUnused(env, library, oldCover);
       return json({ success: true, cover: coverKey });
     }
 
@@ -629,10 +656,12 @@ export default {
       const target = library.soundtracks[id];
       const track = target && target.tracks.find((t) => t.key === key && !t.soundtrackId);
       if (!track) return new Response("Unknown track", { status: 404, headers: corsHeaders });
-      if (track.cover) await env.MUSIC_BUCKET.delete(track.cover);
+      const oldCover = track.cover;
       delete track.cover;
+      delete track.coverFull;
       track.coverOff = true;
       await saveLibrary(env, library);
+      await deleteCoverIfUnused(env, library, oldCover);
       return json({ success: true });
     }
 
@@ -786,9 +815,12 @@ export default {
       const key = decodeURIComponent(path.replace("/api/stream/", ""));
       // honor Range requests so the browser can start playing and skip/seek without pulling the whole file
       const hasRange = request.headers.has("Range");
+      // images: track art never changes under its (hash) name, so the browser may keep it for good; other images
+      // (soundtrack covers) are kept but re-checked each time, and an unchanged one costs only a tiny 304 reply
+      const isImage = !hasRange && /\.(jpe?g|png|webp|gif)$/i.test(key);
       let object;
       try {
-        object = await env.MUSIC_BUCKET.get(key, hasRange ? { range: request.headers } : undefined);
+        object = await env.MUSIC_BUCKET.get(key, hasRange ? { range: request.headers } : isImage ? { onlyIf: request.headers } : undefined);
       } catch (e) {
         return new Response("Range not satisfiable", { status: 416, headers: corsHeaders });
       }
@@ -801,6 +833,10 @@ export default {
       object.writeHttpMetadata(headers);
       headers.set("etag", object.httpEtag);
       headers.set("Accept-Ranges", "bytes");
+      if (isImage) {
+        headers.set("Cache-Control", key.includes("/.track-covers/") ? "private, max-age=31536000, immutable" : "private, no-cache");
+        if (!object.body) return new Response(null, { status: 304, headers }); // the browser's copy is still current
+      }
 
       let status = 200;
       if (hasRange && object.range) {
