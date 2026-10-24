@@ -304,7 +304,7 @@
   .sync-badge {
     position: fixed; top: 12px; right: 16px; z-index: 50;
     background: #181818; border: 1px solid #333; border-radius: 12px;
-    padding: 3px 10px; font-size: 12px; color: var(--text-dim); pointer-events: none;
+    padding: 3px 10px; font-size: 12px; color: var(--text-dim); cursor: pointer;
   }
   .sync-badge.offline { color: #e0a030; border-color: #e0a030; }
 
@@ -969,8 +969,10 @@ function App() {
   const lastFlushRef = useRef(0);
   const [syncStatus, setSyncStatus] = useState("");
   const lastOkRef = useRef(0);
+  const manualSyncRef = useRef(false);
 
   function markSynced() {
+    manualSyncRef.current = false;
     lastOkRef.current = Date.now();
     setSyncStatus("Synced " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
   }
@@ -978,7 +980,9 @@ function App() {
   // one failed request is not "unsynced": only say so if the browser reports offline, or nothing has worked for 45 seconds
   function markFailed(err) {
     console.warn("progress sync failed:", err);
-    if (navigator.onLine === false || Date.now() - lastOkRef.current > 45000) setSyncStatus("Unsynced");
+    // after a manual "sync now" tap, always report the result
+    if (manualSyncRef.current || navigator.onLine === false || Date.now() - lastOkRef.current > 45000) setSyncStatus("Unsynced");
+    manualSyncRef.current = false;
   }
 
   function persistPending() {
@@ -1048,6 +1052,15 @@ function App() {
       markFailed(e);
       return null;
     }
+  }
+
+  // tapping the status label tries again right away
+  function syncNow() {
+    if (syncStatus === "Syncing...") return;
+    manualSyncRef.current = true;
+    setSyncStatus("Syncing...");
+    flushProgress(false);
+    pullProgress();
   }
 
   useEffect(() => {
@@ -3202,7 +3215,7 @@ function App() {
       </div>
 
       {syncStatus && ((viewingSoundtrack && viewingSoundtrack.feedUrl) || isExternal(playingKey)) && (
-        <div className={"sync-badge" + (syncStatus === "Unsynced" ? " offline" : "")}>{syncStatus}</div>
+        <div className={"sync-badge" + (syncStatus === "Unsynced" ? " offline" : "")} onClick={syncNow} title="Tap to sync now">{syncStatus}</div>
       )}
 
       {(uploadProgress || sdlActive || dlActive) && (
